@@ -26,6 +26,7 @@ from telegram.ext import (
 )
 
 from aiohttp import web
+import aiohttp
 
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 PORT = int(os.getenv('PORT', 10000))
@@ -33,7 +34,7 @@ MAX_QUEUE_SIZE = 5
 TELEGRAM_MESSAGE_LIMIT = 4050
 CONTENT_LIMIT_FOR_INTERVALS = 60000
 SEND_INTERVAL = 3.5
-MESSAGE_DELAY = 0.5  # Added: Delay between messages
+MESSAGE_DELAY = 0.5  # Added: Delay between messages in seconds
 
 ALLOWED_USERS_STR = os.getenv('ALLOWED_USERS', '6389552329')
 ALLOWED_IDS = set()
@@ -312,13 +313,11 @@ def process_csv_file(file_bytes: bytes, operation: str) -> str:
 
 async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                                     message: str, message_thread_id: Optional[int] = None, 
-                                    retries: int = 5, filename: Optional[str] = None,  # Increased retries from 3 to 5
+                                    retries: int = 5, filename: Optional[str] = None,  # Increased retries
                                     notification_type: str = 'content') -> bool:
     for attempt in range(retries):
         try:
-            # Ensure message doesn't exceed limit
             if len(message) > TELEGRAM_MESSAGE_LIMIT:
-                logger.warning(f"Message truncated from {len(message)} to {TELEGRAM_MESSAGE_LIMIT} characters")
                 message = message[:TELEGRAM_MESSAGE_LIMIT]
             
             sent_message = await context.bot.send_message(
@@ -337,14 +336,14 @@ async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT
                 elif notification_type == 'notification':
                     file_notification_mapping[filename] = sent_message.message_id
             
-            # Added delay between messages
-            await asyncio.sleep(MESSAGE_DELAY)
-            
             return True
         except Exception as e:
-            logger.error(f"Attempt {attempt + 1}/{retries} failed for chat {chat_id}: {e}")
+            logger.error(f"Attempt {attempt + 1} failed for chat {chat_id}: {e}")
             if attempt < retries - 1:
-                await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+                wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4, 8, 16 seconds
+                await asyncio.sleep(wait_time)
+    
+    logger.error(f"Failed to send message after {retries} attempts for chat {chat_id}")
     return False
 
 async def track_other_notification(chat_id: int, filename: str, message_id: int):
@@ -356,15 +355,17 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
                                 chunks: List[str], filename: str, message_thread_id: Optional[int] = None) -> bool:
     try:
         total_messages_sent = 0
-        failed_chunks = 0
         
         for i, chunk in enumerate(chunks, 1):
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_sent += 1
+                
+                # Added: Delay between messages to prevent rate limiting
+                if i < len(chunks):
+                    await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for `{filename}`")
-                failed_chunks += 1
-                # Don't stop on single failure, continue with other chunks
+                return False  # Stop on failure
         
         state = get_user_state(chat_id)
         state.last_send = datetime.now(UTC_PLUS_1)
@@ -373,8 +374,7 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
             completion_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
-                text=f"✅ Completed: `{filename}`\n📊 Sent {total_messages_sent} message{'s' if total_messages_sent > 1 else ''}" + 
-                     (f"\n⚠️ Failed chunks: {failed_chunks}" if failed_chunks > 0 else ""),
+                text=f"✅ Completed: `{filename}`\n📊 Sent {total_messages_sent} message{'s' if total_messages_sent > 1 else ''}",
                 disable_notification=True,
                 parse_mode='Markdown'
             )
@@ -407,19 +407,23 @@ async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TY
             )
             await track_other_notification(chat_id, filename, part_header_msg.message_id)
             total_messages_in_part += 1
-            await asyncio.sleep(MESSAGE_DELAY)  # Delay after header
         
         for i, chunk in enumerate(chunks, 1):
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_in_part += 1
+                
+                # Added: Delay between messages to prevent rate limiting
+                if i < len(chunks):
+                    await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for part {part_num} of `{filename}`")
+                return False  # Stop on failure
         
-        return total_messages_in_part
+        return total_messages_in_part > 0
         
     except Exception as e:
         logger.error(f"Error sending large content part: {e}")
-        return 0
+        return False
 
 async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                             parts: List[str], filename: str, state: UserState, 
@@ -445,18 +449,9 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
                 chat_id, context, part, i, total_parts, filename, message_thread_id
             )
             
-            if messages_in_part <= 0:
+            if not messages_in_part:  # Changed: Check for False instead of <= 0
                 logger.error(f"Failed to send part {i} of `{filename}`")
-                # Continue with next part instead of failing completely
-                if i < total_parts:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        message_thread_id=message_thread_id,
-                        text=f"⚠️ Skipping part {i} of `{filename}` due to errors",
-                        disable_notification=True,
-                        parse_mode='Markdown'
-                    )
-                continue
+                return False
             
             total_messages_sent += messages_in_part
             
@@ -545,6 +540,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     )
                     await track_other_notification(chat_id, filename, sending_msg.message_id)
             
+            success = False
             if file_info.get('requires_intervals', False):
                 success = await send_with_intervals(
                     chat_id, context, 
@@ -561,13 +557,13 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     file_message_thread_id
                 )
             
-            if state.queue:
+            # Always remove the file from queue after processing (success or failure)
+            if state.queue and state.queue[0]['name'] == filename:
                 processed_file = state.queue.popleft()
                 processed_filename = processed_file['name']
                 
                 if success and not state.cancel_requested:
                     logger.info(f"Successfully processed `{processed_filename}` for chat {chat_id}")
-                    await cleanup_completed_file(processed_filename, chat_id)
                 else:
                     logger.error(f"Failed to process `{processed_filename}` for chat {chat_id}")
                     failed_msg = await context.bot.send_message(
@@ -578,8 +574,6 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                         parse_mode='Markdown'
                     )
                     await track_other_notification(chat_id, processed_filename, failed_msg.message_id)
-                    # Remove the failed file from tracking
-                    await cleanup_completed_file(processed_filename, chat_id)
             
             state.current_parts = []
             state.current_index = 0
@@ -1294,25 +1288,35 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        # Download file with timeout
+        # Added timeout for file download to prevent "Timed out" error
         file = await context.bot.get_file(doc.file_id)
         
-        # Added timeout for file download (30 seconds)
+        # Download with timeout
         try:
             file_bytes = await asyncio.wait_for(
                 file.download_as_bytearray(),
-                timeout=30.0
+                timeout=30.0  # 30 second timeout for file download
             )
         except asyncio.TimeoutError:
             await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
-                text=f"❌ **File download timeout**\n"
-                     f"File `{file_name}` is too large or network is slow.\n"
+                text=f"❌ **Download timeout**\n"
+                     f"File `{file_name}` is too large or download failed.\n"
                      f"Please try again with a smaller file.",
                 parse_mode='Markdown'
             )
-            logger.error(f"File download timeout for {file_name}")
+            return
+        except Exception as e:
+            logger.error(f"File download error: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"❌ **Download failed**\n"
+                     f"Could not download file `{file_name}`.\n"
+                     f"Please try again.",
+                parse_mode='Markdown'
+            )
             return
         
         ext = Path(file_name).suffix.lower()
@@ -1408,25 +1412,21 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_notification_mapping[file_name] = sent_msg.message_id
             
     except asyncio.TimeoutError:
+        logger.error(f"File processing timeout for {file_name}")
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
-            text=f"❌ **Operation timed out**\n"
-                 f"Processing file `{file_name}` took too long.\n"
-                 f"Please try again with a smaller file.",
+            text=f"❌ **Processing timeout**\n"
+                 f"File `{file_name}` is too large to process.\n"
+                 f"Please try with a smaller file.",
             parse_mode='Markdown'
         )
-        logger.error(f"File processing timeout for {file_name}")
     except Exception as e:
         logger.error(f"File processing error: {e}")
-        error_msg = str(e)
-        if "timed out" in error_msg.lower():
-            error_msg = "Operation timed out. Please try again with a smaller file."
-        
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
-            text=f"❌ Error processing file\n{error_msg[:200]}",
+            text=f"❌ Error processing file\n{str(e)[:200]}",
             parse_mode='Markdown'
         )
 
