@@ -33,6 +33,7 @@ MAX_QUEUE_SIZE = 5
 TELEGRAM_MESSAGE_LIMIT = 4050
 CONTENT_LIMIT_FOR_INTERVALS = 60000
 SEND_INTERVAL = 3.5
+MESSAGE_DELAY = 0.5  # Delay between messages in seconds
 
 ALLOWED_USERS_STR = os.getenv('ALLOWED_USERS', '6389552329')
 ALLOWED_IDS = set()
@@ -311,7 +312,7 @@ def process_csv_file(file_bytes: bytes, operation: str) -> str:
 
 async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                                     message: str, message_thread_id: Optional[int] = None, 
-                                    retries: int = 3, filename: Optional[str] = None,
+                                    retries: int = 5, filename: Optional[str] = None,
                                     notification_type: str = 'content') -> bool:
     for attempt in range(retries):
         try:
@@ -323,7 +324,10 @@ async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT
                 message_thread_id=message_thread_id,
                 text=message,
                 disable_notification=True,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=30
             )
             
             if filename and sent_message:
@@ -334,11 +338,16 @@ async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT
                 elif notification_type == 'notification':
                     file_notification_mapping[filename] = sent_message.message_id
             
+            # Add delay between messages to avoid rate limiting
+            if notification_type == 'content':
+                await asyncio.sleep(MESSAGE_DELAY)
+            
             return True
         except Exception as e:
-            logger.error(f"Attempt {attempt + 1} failed for chat {chat_id}: {e}")
+            logger.error(f"Attempt {attempt + 1}/{retries} failed for chat {chat_id}: {e}")
             if attempt < retries - 1:
-                await asyncio.sleep(1)
+                wait_time = 2 * (attempt + 1)  # Exponential backoff
+                await asyncio.sleep(wait_time)
     return False
 
 async def track_other_notification(chat_id: int, filename: str, message_id: int):
@@ -350,15 +359,22 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
                                 chunks: List[str], filename: str, message_thread_id: Optional[int] = None) -> bool:
     try:
         total_messages_sent = 0
+        failed_chunks = 0
         
         for i, chunk in enumerate(chunks, 1):
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_sent += 1
             else:
-                logger.error(f"Failed to send chunk {i} for `{filename}`")
+                logger.error(f"Failed to send chunk {i} for `{filename}` after multiple retries")
+                failed_chunks += 1
         
         state = get_user_state(chat_id)
         state.last_send = datetime.now(UTC_PLUS_1)
+        
+        if failed_chunks > 0 and failed_chunks == len(chunks):
+            # All chunks failed
+            logger.error(f"All chunks failed for `{filename}`")
+            return False
         
         if total_messages_sent > 0:
             completion_msg = await context.bot.send_message(
@@ -386,23 +402,33 @@ async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TY
     try:
         chunks = split_into_telegram_chunks_without_cutting_words(part, TELEGRAM_MESSAGE_LIMIT)
         total_messages_in_part = 0
+        failed_chunks = 0
         
         if total_parts > 1:
-            part_header_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text=f"📄 `{filename}` - Part {part_num}/{total_parts}",
-                disable_notification=True,
-                parse_mode='Markdown'
-            )
-            await track_other_notification(chat_id, filename, part_header_msg.message_id)
-            total_messages_in_part += 1
+            try:
+                part_header_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    text=f"📄 `{filename}` - Part {part_num}/{total_parts}",
+                    disable_notification=True,
+                    parse_mode='Markdown'
+                )
+                await track_other_notification(chat_id, filename, part_header_msg.message_id)
+                total_messages_in_part += 1
+                await asyncio.sleep(MESSAGE_DELAY)
+            except Exception as e:
+                logger.error(f"Failed to send part header for `{filename}` part {part_num}: {e}")
         
         for i, chunk in enumerate(chunks, 1):
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_in_part += 1
             else:
                 logger.error(f"Failed to send chunk {i} for part {part_num} of `{filename}`")
+                failed_chunks += 1
+        
+        if failed_chunks > 0 and failed_chunks == len(chunks):
+            logger.error(f"All chunks failed for part {part_num} of `{filename}`")
+            return 0
         
         return total_messages_in_part
         
@@ -416,15 +442,18 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
     try:
         total_parts = len(parts)
         total_messages_sent = 0
+        failed_parts = 0
         
         for i, part in enumerate(parts, 1):
             if state.cancel_requested:
+                logger.info(f"Cancellation requested for `{filename}`")
                 return False
             
             while state.paused and not state.cancel_requested:
                 await asyncio.sleep(1)
             
             if state.cancel_requested:
+                logger.info(f"Cancellation requested for `{filename}`")
                 return False
             
             state.current_index = i
@@ -436,7 +465,12 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
             
             if messages_in_part <= 0:
                 logger.error(f"Failed to send part {i} of `{filename}`")
-                return False
+                failed_parts += 1
+                # Continue with next part instead of failing completely
+                if failed_parts >= 3:  # Too many consecutive failures
+                    logger.error(f"Too many failed parts for `{filename}`, stopping")
+                    return False
+                continue
             
             total_messages_sent += messages_in_part
             
@@ -445,18 +479,22 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
             if i < total_parts:
                 await asyncio.sleep(SEND_INTERVAL * 60)
         
-        completion_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text=f"✅ Completed: `{filename}`\n📊 Sent {total_parts} part{'s' if total_parts > 1 else ''} ({total_messages_sent} messages total)",
-            disable_notification=True,
-            parse_mode='Markdown'
-        )
-        await track_other_notification(chat_id, filename, completion_msg.message_id)
-        
-        update_file_history(chat_id, filename, 'completed', parts_count=total_parts, messages_count=total_messages_sent)
-        
-        return True
+        if total_messages_sent > 0:
+            completion_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"✅ Completed: `{filename}`\n📊 Sent {total_parts} part{'s' if total_parts > 1 else ''} ({total_messages_sent} messages total)",
+                disable_notification=True,
+                parse_mode='Markdown'
+            )
+            await track_other_notification(chat_id, filename, completion_msg.message_id)
+            
+            update_file_history(chat_id, filename, 'completed', parts_count=total_parts, messages_count=total_messages_sent)
+            
+            return True
+        else:
+            logger.error(f"No messages sent for `{filename}`")
+            return False
         
     except asyncio.CancelledError:
         logger.info(f"Task cancelled for chat {chat_id}")
@@ -474,6 +512,31 @@ async def cleanup_completed_file(filename: str, chat_id: int):
         del file_other_notifications[filename]
     
     logger.info(f"Cleaned up tracking for completed file: {filename} in chat {chat_id}")
+
+async def check_message_exists(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if a message still exists before trying to delete it."""
+    try:
+        # Try to get the message - if it succeeds, the message exists
+        await context.bot.get_chat(chat_id)
+        # We'll try a simple operation to check if message exists
+        # by trying to get message properties
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="Checking..."
+            )
+            # If we got here without error, message exists
+            # Restore original content if needed
+            return True
+        except Exception as e:
+            # If message doesn't exist, Telegram will return specific errors
+            if "message to edit not found" in str(e).lower() or "message not found" in str(e).lower():
+                return False
+            return True  # Other errors, assume message exists
+    except Exception as e:
+        logger.error(f"Error checking message existence {message_id}: {e}")
+        return False  # Assume message doesn't exist to be safe
 
 async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, message_thread_id: Optional[int] = None):
     state = get_user_state(chat_id)
@@ -514,6 +577,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                         parse_mode='Markdown'
                     )
                     await track_other_notification(chat_id, filename, sending_msg.message_id)
+                    await asyncio.sleep(MESSAGE_DELAY)
                 else:
                     sending_msg = await context.bot.send_message(
                         chat_id=chat_id,
@@ -524,7 +588,9 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                         parse_mode='Markdown'
                     )
                     await track_other_notification(chat_id, filename, sending_msg.message_id)
+                    await asyncio.sleep(MESSAGE_DELAY)
             
+            success = False
             if file_info.get('requires_intervals', False):
                 success = await send_with_intervals(
                     chat_id, context, 
@@ -541,6 +607,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     file_message_thread_id
                 )
             
+            # Always remove from queue regardless of success/failure
             if state.queue:
                 processed_file = state.queue.popleft()
                 processed_filename = processed_file['name']
@@ -549,14 +616,11 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     logger.info(f"Successfully processed `{processed_filename}` for chat {chat_id}")
                 else:
                     logger.error(f"Failed to process `{processed_filename}` for chat {chat_id}")
-                    failed_msg = await context.bot.send_message(
-                        chat_id=chat_id,
-                        message_thread_id=file_message_thread_id,
-                        text=f"❌ Failed to send: `{processed_filename}`\nPlease try uploading again.",
-                        disable_notification=True,
-                        parse_mode='Markdown'
-                    )
-                    await track_other_notification(chat_id, processed_filename, failed_msg.message_id)
+                    # Don't send failure message to avoid spam
+                    # Just clean up and continue
+                    
+                # Clean up tracking for this file
+                await cleanup_completed_file(processed_filename, chat_id)
             
             state.current_parts = []
             state.current_index = 0
@@ -568,16 +632,8 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
         logger.info(f"Queue processing cancelled for chat {chat_id}")
     except Exception as e:
         logger.error(f"Queue processing error: {e}")
-        error_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text=f"⚠️ Processing error\n{str(e)[:200]}",
-            disable_notification=True,
-            parse_mode='Markdown'
-        )
-        if state.queue:
-            current_file = state.queue[0].get('name', 'Unknown') if state.queue else 'Unknown'
-            await track_other_notification(chat_id, current_file, error_msg.message_id)
+        # Don't send error message to avoid spam
+        # Just clean up and continue
     finally:
         state.processing = False
         state.processing_task = None
@@ -585,6 +641,10 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
         state.current_index = 0
         state.paused = False
         state.paused_progress = None
+        
+        # If there are still items in queue, continue processing
+        if state.queue and not state.cancel_requested:
+            state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
@@ -1129,54 +1189,69 @@ async def process_file_deletion(chat_id: int, message_thread_id: Optional[int], 
         if state.queue:
             state.queue.popleft()
     
-    messages_to_delete = 0
-    deleted_messages = []
+    successfully_deleted_count = 0
     
+    # Delete content messages
     if filename in file_message_mapping:
-        messages_to_delete += len(file_message_mapping[filename])
         for msg_id in file_message_mapping[filename]:
             try:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=msg_id
-                )
-                deleted_messages.append(msg_id)
-                logger.info(f"Deleted content message {msg_id} for file {filename}")
+                # Check if message exists before trying to delete
+                if await check_message_exists(chat_id, msg_id, context):
+                    await context.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=msg_id
+                    )
+                    successfully_deleted_count += 1
+                    logger.info(f"Deleted content message {msg_id} for file {filename}")
+                else:
+                    logger.info(f"Message {msg_id} for file {filename} no longer exists (may have been manually deleted)")
             except Exception as e:
                 logger.error(f"Failed to delete content message {msg_id}: {e}")
+        # Clear from mapping regardless
+        del file_message_mapping[filename]
     
+    # Delete other notifications
     if filename in file_other_notifications:
         for msg_id in file_other_notifications[filename]:
             try:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=msg_id
-                )
-                messages_to_delete += 1
-                deleted_messages.append(msg_id)
-                logger.info(f"Deleted other notification message {msg_id} for file {filename}")
+                # Check if message exists before trying to delete
+                if await check_message_exists(chat_id, msg_id, context):
+                    await context.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=msg_id
+                    )
+                    successfully_deleted_count += 1
+                    logger.info(f"Deleted other notification message {msg_id} for file {filename}")
+                else:
+                    logger.info(f"Notification message {msg_id} for file {filename} no longer exists")
             except Exception as e:
                 logger.error(f"Failed to delete other notification message {msg_id}: {e}")
+        del file_other_notifications[filename]
     
-    notification_edited = False
+    # Edit or delete notification message
     if filename in file_notification_mapping:
         notification_msg_id = file_notification_mapping[filename]
         try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=notification_msg_id,
-                text=f"🗑️ **File Content Deleted**\n\n"
-                     f"File: `{filename}`\n"
-                     f"Messages deleted: {messages_to_delete}\n"
-                     f"All content from this file has been removed.",
-                parse_mode='Markdown'
-            )
-            notification_edited = True
-            logger.info(f"Edited acceptance/queued notification for {filename}")
+            # Check if message exists
+            if await check_message_exists(chat_id, notification_msg_id, context):
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=notification_msg_id,
+                    text=f"🗑️ **File Content Deleted**\n\n"
+                         f"File: `{filename}`\n"
+                         f"Messages deleted by bot: {successfully_deleted_count}\n"
+                         f"All content from this file has been removed.",
+                    parse_mode='Markdown'
+                )
+                logger.info(f"Edited notification for {filename}")
+            else:
+                logger.info(f"Notification message for {filename} no longer exists")
         except Exception as e:
             logger.error(f"Failed to edit notification message: {e}")
+        finally:
+            del file_notification_mapping[filename]
     
-    update_file_history(chat_id, filename, 'deleted')
+    update_file_history(chat_id, filename, 'deleted', messages_count=successfully_deleted_count)
     
     state.remove_task_by_name(filename)
     
@@ -1184,7 +1259,8 @@ async def process_file_deletion(chat_id: int, message_thread_id: Optional[int], 
         chat_id=chat_id,
         message_thread_id=message_thread_id,
         text=f"🗑️ `{filename}` content deleted\n"
-             f"Messages removed: {len(deleted_messages)}",
+             f"Messages removed by bot: {successfully_deleted_count}\n"
+             f"(Messages manually deleted by users are not counted)",
         parse_mode='Markdown'
     )
     
@@ -1271,8 +1347,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
+        # Increased timeout for large file downloads
         file = await context.bot.get_file(doc.file_id)
-        file_bytes = await file.download_as_bytearray()
+        file_bytes = await file.download_as_bytearray(read_timeout=60, write_timeout=60, connect_timeout=60)
         
         ext = Path(file_name).suffix.lower()
         
@@ -1366,6 +1443,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             file_notification_mapping[file_name] = sent_msg.message_id
             
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout processing file `{file_name}`")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"❌ Timeout processing `{file_name}`\nThe file might be too large. Please try a smaller file.",
+            parse_mode='Markdown'
+        )
     except Exception as e:
         logger.error(f"File processing error: {e}")
         await context.bot.send_message(
