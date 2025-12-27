@@ -392,7 +392,7 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
 
 async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                                 part: str, part_num: int, total_parts: int, 
-                                filename: str, message_thread_id: Optional[int] = None) -> bool:
+                                filename: str, message_thread_id: Optional[int] = None) -> int:
     try:
         chunks = split_into_telegram_chunks_without_cutting_words(part, TELEGRAM_MESSAGE_LIMIT)
         total_messages_in_part = 0
@@ -417,20 +417,20 @@ async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TY
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for part {part_num} of `{filename}`")
-                return False  # Stop on failure
+                return 0  # Return 0 on failure
         
-        return total_messages_in_part > 0
+        return total_messages_in_part  # Return actual count
         
     except Exception as e:
         logger.error(f"Error sending large content part: {e}")
-        return False
+        return 0  # Return 0 on error
 
 async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                             parts: List[str], filename: str, state: UserState, 
                             message_thread_id: Optional[int] = None) -> bool:
     try:
         total_parts = len(parts)
-        total_messages_sent = 0
+        total_messages_sent = 0  # Initialize total messages counter
         
         for i, part in enumerate(parts, 1):
             if state.cancel_requested:
@@ -449,17 +449,18 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
                 chat_id, context, part, i, total_parts, filename, message_thread_id
             )
             
-            if not messages_in_part:  # Changed: Check for False instead of <= 0
+            if not messages_in_part:  # Check for 0 (failure) instead of <= 0
                 logger.error(f"Failed to send part {i} of `{filename}`")
                 return False
             
-            total_messages_sent += messages_in_part
+            total_messages_sent += messages_in_part  # Accumulate actual messages
             
             state.last_send = datetime.now(UTC_PLUS_1)
             
             if i < total_parts:
                 await asyncio.sleep(SEND_INTERVAL * 60)
         
+        # Use actual messages count, not parts count
         completion_msg = await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
