@@ -377,7 +377,7 @@ async def cancelpreview_command(update: Update, context: ContextTypes.DEFAULT_TY
             chat_id=update.effective_chat.id,
             message_thread_id=update.effective_message.message_thread_id,
             text="ℹ️ **Not in preview mode**\n"
-                 "Use `/adminpreview` to start preview mode.",
+                 "Use /adminpreview to start preview mode.",
             parse_mode='Markdown'
         )
         return
@@ -388,7 +388,8 @@ async def cancelpreview_command(update: Update, context: ContextTypes.DEFAULT_TY
         chat_id=update.effective_chat.id,
         message_thread_id=update.effective_message.message_thread_id,
         text="🚫 **Preview Mode Cancelled**\n\n"
-             "Preview mode has been deactivated.",
+             "Preview mode has been deactivated.\n\n"
+                 "Use /adminpreview to start preview mode again.",
         parse_mode='Markdown'
     )
 
@@ -453,7 +454,8 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
             chat_id=chat_id,
             message_thread_id=message_thread_id,
             text="⚠️ **Empty message**\n"
-                 "Please send a message with preview content to check.\n\nUse /cancelpreview to cancel.",
+                 "Please send a message with preview content to check.\n\n"
+                 "Use /cancelpreview to cancel.",
             parse_mode='Markdown'
         )
         return
