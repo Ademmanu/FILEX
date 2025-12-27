@@ -35,7 +35,7 @@ MAX_QUEUE_SIZE = 5
 TELEGRAM_MESSAGE_LIMIT = 4050
 CONTENT_LIMIT_FOR_INTERVALS = 60000
 SEND_INTERVAL = 3.5
-MESSAGE_DELAY = 0.5  # Added: Delay between messages in seconds
+MESSAGE_DELAY = 0.5
 
 ALLOWED_USERS_STR = os.getenv('ALLOWED_USERS', '6389552329')
 ALLOWED_IDS = set()
@@ -82,8 +82,8 @@ class MessageEntry:
 
 # Global storage for message tracking
 message_tracking: List[MessageEntry] = []
-MAX_TRACKED_MESSAGES = 1000  # Maximum messages to track
-admin_preview_mode: Dict[int, Dict[str, any]] = {}  # admin_user_id -> {state, previews}
+MAX_TRACKED_MESSAGES = 1000
+admin_preview_mode: Set[int] = set()  # Just track which admins are in preview mode
 
 # ==================== FILE HISTORY FUNCTIONS ====================
 def update_file_history(chat_id: int, filename: str, status: str, parts_count: int = 0, messages_count: int = 0):
@@ -161,11 +161,11 @@ async def check_admin_authorization(update: Update, context: ContextTypes.DEFAUL
 # ==================== MESSAGE TRACKING FUNCTIONS ====================
 def extract_first_two_words(text: str) -> str:
     """Extract first two words from text, handling markdown and special chars"""
-    # Remove markdown formatting
-    clean_text = re.sub(r'[*_`\[\]()]', ' ', text)
+    # Remove markdown formatting but keep normal text
+    clean_text = text
     # Remove URLs
     clean_text = re.sub(r'https?://\S+', ' ', clean_text)
-    # Remove extra whitespace
+    # Replace multiple spaces with single space
     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
     
     # Split into words and take first two
@@ -247,59 +247,36 @@ def get_tracking_stats() -> Dict[str, any]:
         'total': len(message_tracking),
         'oldest': oldest,
         'newest': newest,
-        'unique_words': unique_words,
-        'expires_in': f"{(oldest + timedelta(hours=72) - datetime.now(UTC_PLUS_1)).total_seconds() / 3600:.1f}h"
+        'unique_words': unique_words
     }
 
 # ==================== PREVIEW PROCESSING FUNCTIONS ====================
 def extract_preview_sections(text: str) -> List[str]:
-    """Extract all 'Preview:' sections from report text"""
+    """Extract all 'Preview:' sections from report text - exact matching"""
     preview_sections = []
     
-    # Pattern to match "Preview: " followed by content (until end of line or next section)
-    pattern = r'[Pp]review:\s*(.+?)(?=\n\s*(?:🕒|📝|📊|Preview:|$))'
+    # Pattern to match "Preview: " followed by content until end of line
+    # This handles the specific format in your example
+    pattern = r'📝\s*[Pp]review:\s*(.+?)(?=\n|\r|$)'
     
-    matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+    matches = re.findall(pattern, text, re.DOTALL)
     
     for match in matches:
-        # Clean up the match
+        # Clean up the match - remove trailing whitespace
         preview_text = match.strip()
         if preview_text:
             preview_sections.append(preview_text)
     
+    # If no matches with emoji format, try without emoji
+    if not preview_sections:
+        pattern2 = r'[Pp]review:\s*(.+?)(?=\n|\r|$)'
+        matches2 = re.findall(pattern2, text, re.DOTALL)
+        for match in matches2:
+            preview_text = match.strip()
+            if preview_text:
+                preview_sections.append(preview_text)
+    
     return preview_sections
-
-def extract_preview_from_any_message(text: str) -> List[str]:
-    """Extract preview from any message format - try multiple patterns"""
-    previews = []
-    
-    # Pattern 1: Standard "Preview: content" format
-    pattern1 = r'[Pp]review:\s*(.+?)(?=\n\s*(?:🕒|📝|📊|Preview:|$))'
-    matches1 = re.findall(pattern1, text, re.DOTALL | re.IGNORECASE)
-    
-    # Pattern 2: Content that looks like numbers or words (for direct messages)
-    if not matches1:
-        # Look for lines that contain sequences that look like preview content
-        lines = text.split('\n')
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith(('🕒', '📝', '📊', '👤', '━━')):
-                # Check if line looks like preview content (numbers, words, etc.)
-                if re.match(r'^[\d\w\s]+$', line) and len(line) > 3:
-                    previews.append(line)
-    
-    if matches1:
-        previews.extend([match.strip() for match in matches1 if match.strip()])
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_previews = []
-    for preview in previews:
-        if preview not in seen:
-            seen.add(preview)
-            unique_previews.append(preview)
-    
-    return unique_previews
 
 def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str], List[str]]:
     """
@@ -326,60 +303,38 @@ def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str],
     
     return (matches, non_matches)
 
-def format_preview_report(matches: List[str], non_matches: List[str], 
-                         total_previews: int, stats: Dict[str, any]) -> str:
-    """Format the preview report for display"""
+def format_preview_report_exact(matches: List[str], non_matches: List[str], 
+                               total_previews: int) -> str:
+    """Format the preview report exactly like the example provided"""
+    
+    if total_previews == 0:
+        return "❌ **No preview content found**\n\nNo valid preview sections found in the message."
+    
     report_lines = []
-    
-    if stats['total'] == 0:
-        report_lines.append("⚠️ **No messages stored in database**")
-        report_lines.append(f"Database: 0 messages")
-        return "\n".join(report_lines)
-    
     report_lines.append("📊 **Preview Analysis Report**")
-    report_lines.append("─" * 30)
-    
-    # Statistics
-    report_lines.append(f"📈 **Database Statistics:**")
-    report_lines.append(f"• Total entries: {stats['total']}")
-    report_lines.append(f"• Unique word pairs: {stats['unique_words']}")
-    report_lines.append(f"• Oldest entry: {stats['oldest'].strftime('%H:%M:%S')}")
-    report_lines.append(f"• Newest entry: {stats['newest'].strftime('%H:%M:%S')}")
-    report_lines.append(f"• Expires in: {stats['expires_in']}")
-    
+    report_lines.append("─" * 35)
     report_lines.append("")
-    report_lines.append(f"📋 **Preview Analysis:**")
+    report_lines.append("📋 **Preview Analysis:**")
+    
+    match_percent = (len(matches) / total_previews * 100) if total_previews > 0 else 0
+    non_match_percent = (len(non_matches) / total_previews * 100) if total_previews > 0 else 0
+    
     report_lines.append(f"• Total previews checked: {total_previews}")
-    report_lines.append(f"• Matches found: {len(matches)} ({len(matches)/total_previews*100:.1f}%)")
-    report_lines.append(f"• Non-matches: {len(non_matches)} ({len(non_matches)/total_previews*100:.1f}%)")
-    
-    # Matches section
-    if matches:
-        report_lines.append("")
-        report_lines.append("✅ **MATCHES FOUND:**")
-        for i, match in enumerate(matches, 1):
-            truncated = match[:40] + "..." if len(match) > 40 else match
-            report_lines.append(f"{i}. `{truncated}`")
-    else:
-        report_lines.append("")
-        report_lines.append("❌ **NO MATCHES FOUND**")
-        report_lines.append("None of the previews were found in the database.")
-    
-    # Non-matches section  
-    if non_matches:
-        report_lines.append("")
-        report_lines.append("⚠️ **NON-MATCHES:**")
-        for i, non_match in enumerate(non_matches[:10], 1):  # Show first 10 non-matches
-            truncated = non_match[:40] + "..." if len(non_match) > 40 else non_match
-            report_lines.append(f"{i}. `{truncated}`")
-        
-        if len(non_matches) > 10:
-            report_lines.append(f"... and {len(non_matches) - 10} more")
-    
+    report_lines.append(f"• Matches found: {len(matches)} ({match_percent:.1f}%)")
+    report_lines.append(f"• Non-matches: {len(non_matches)} ({non_match_percent:.1f}%)")
     report_lines.append("")
-    report_lines.append("📝 **Next Steps:**")
-    report_lines.append("• Send another message with previews to check")
-    report_lines.append("• Use `/cancelpreview` to exit preview mode")
+    
+    if matches:
+        report_lines.append("✅ **Matches found in database:**")
+        for i, match in enumerate(matches, 1):
+            report_lines.append(f"{i}. {match}")
+    
+    if non_matches:
+        if matches:
+            report_lines.append("")
+        report_lines.append("⚠️ **Not found in database:**")
+        for i, non_match in enumerate(non_matches, 1):
+            report_lines.append(f"{i}. {non_match}")
     
     return "\n".join(report_lines)
 
@@ -390,32 +345,16 @@ async def adminpreview_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    message_thread_id = update.effective_message.message_thread_id
     
-    # Initialize preview mode for this admin
-    admin_preview_mode[user_id] = {
-        'previews': [],
-        'chat_id': chat_id,
-        'message_thread_id': message_thread_id,
-        'started_at': datetime.now(UTC_PLUS_1)
-    }
+    admin_preview_mode.add(user_id)
     
     await context.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=message_thread_id,
-        text="🔍 **Admin Preview Mode ACTIVATED**\n\n"
-             "📝 **How it works:**\n"
-             "1. Send any message with preview content\n"
-             "2. Bot will automatically extract and check previews\n"
-             "3. Shows matches AND non-matches\n"
-             "4. Continue sending messages to check more previews\n"
-             "5. Use `/cancelpreview` to exit\n\n"
-             "📋 **Accepted formats:**\n"
-             "• Full reports with 'Preview:' lines\n"
-             "• Direct preview content (numbers, words)\n"
-             "• Any message containing text to check\n\n"
-             "✅ **Ready for your first preview message!**",
+        chat_id=update.effective_chat.id,
+        message_thread_id=update.effective_message.message_thread_id,
+        text="🔍 **Preview Mode Activated**\n\n"
+             "Send any message with preview content to check.\n"
+             "Each message will be analyzed independently.\n"
+             "Use `/cancelpreview` to exit preview mode.",
         parse_mode='Markdown'
     )
 
@@ -436,17 +375,13 @@ async def cancelpreview_command(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
     
-    # Get stats before clearing
-    previews_checked = len(admin_preview_mode[user_id]['previews'])
-    
-    del admin_preview_mode[user_id]
+    admin_preview_mode.remove(user_id)
     
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         message_thread_id=update.effective_message.message_thread_id,
-        text=f"🚫 **Preview Mode CANCELLED**\n\n"
-             f"Checked {previews_checked} previews in total.\n"
-             f"Preview mode has been deactivated.",
+        text="🚫 **Preview Mode Cancelled**\n\n"
+             "Preview mode has been deactivated.",
         parse_mode='Markdown'
     )
 
@@ -471,16 +406,20 @@ async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     oldest_str = stats['oldest'].strftime('%Y-%m-%d %H:%M:%S')
     newest_str = stats['newest'].strftime('%Y-%m-%d %H:%M:%S')
     
-    # Count active preview sessions
-    active_sessions = len([uid for uid in admin_preview_mode.keys() if uid in ADMIN_IDS])
+    # Calculate expiration time
+    if stats['oldest']:
+        expires_in = stats['oldest'] + timedelta(hours=72) - datetime.now(UTC_PLUS_1)
+        expires_hours = max(0, expires_in.total_seconds() / 3600)
+    else:
+        expires_hours = 0
     
     message = f"📊 **Message Tracking Statistics**\n\n"
     message += f"**Total tracked messages:** {stats['total']}\n"
     message += f"**Unique word pairs:** {stats['unique_words']}\n"
     message += f"**Oldest entry:** {oldest_str}\n"
     message += f"**Newest entry:** {newest_str}\n"
-    message += f"**Expires in:** {stats['expires_in']}\n"
-    message += f"**Active preview sessions:** {active_sessions}\n\n"
+    message += f"**Expires in:** {expires_hours:.1f}h\n"
+    message += f"**Active preview sessions:** {len(admin_preview_mode)}\n\n"
     message += f"Messages auto-delete after 72 hours."
     
     await context.bot.send_message(
@@ -497,9 +436,8 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
     if user_id not in admin_preview_mode:
         return
     
-    state_info = admin_preview_mode[user_id]
-    chat_id = state_info['chat_id']
-    message_thread_id = state_info['message_thread_id']
+    chat_id = update.effective_chat.id
+    message_thread_id = update.effective_message.message_thread_id
     
     # Extract previews from the message
     message_text = update.message.text
@@ -513,89 +451,35 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
         )
         return
     
-    # Extract previews using flexible extraction
-    new_previews = extract_preview_from_any_message(message_text)
+    # Extract previews using exact format matching
+    previews = extract_preview_sections(message_text)
     
-    if not new_previews:
+    if not previews:
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
             text="❌ **No preview content found**\n\n"
-                 "I couldn't find any preview content in your message.\n"
-                 "Try sending:\n"
-                 "• Messages with 'Preview:' lines\n"
-                 "• Direct preview content like '97699115546 97699115547'\n"
-                 "• Any text you want to check against the database",
+                 "I couldn't find any 'Preview:' sections in your message.\n"
+                 "Please use the exact format:\n"
+                 "```\n"
+                 "📝 Preview: [content]\n"
+                 "```",
             parse_mode='Markdown'
         )
         return
     
-    # Add to collected previews
-    state_info['previews'].extend(new_previews)
-    
     # Check against database
-    matches, non_matches = check_preview_against_database(new_previews)
+    matches, non_matches = check_preview_against_database(previews)
+    total_previews = len(previews)
     
-    # Get statistics
-    stats = get_tracking_stats()
+    # Format report exactly as requested
+    report_text = format_preview_report_exact(matches, non_matches, total_previews)
     
-    # Format immediate report for this batch
-    report_lines = []
-    
-    if stats['total'] == 0:
-        report_lines.append("⚠️ **Database is empty**")
-        report_lines.append("No messages have been tracked yet.")
-        report_lines.append(f"Found {len(new_previews)} previews in your message.")
-    else:
-        report_lines.append(f"🔍 **Batch Analysis**")
-        report_lines.append(f"Preview batch size: {len(new_previews)}")
-        report_lines.append(f"• Matches: {len(matches)}")
-        report_lines.append(f"• Non-matches: {len(non_matches)}")
-        
-        if matches:
-            report_lines.append("")
-            report_lines.append("✅ **Batch Matches:**")
-            for i, match in enumerate(matches[:3], 1):
-                truncated = match[:35] + "..." if len(match) > 35 else match
-                report_lines.append(f"{i}. `{truncated}`")
-            if len(matches) > 3:
-                report_lines.append(f"... and {len(matches) - 3} more")
-    
-    # Send immediate batch report
+    # Send the report
     await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=message_thread_id,
-        text="\n".join(report_lines),
-        parse_mode='Markdown'
-    )
-    
-    # Send full summary after a short delay
-    await asyncio.sleep(0.5)
-    
-    # Check all accumulated previews
-    all_matches, all_non_matches = check_preview_against_database(state_info['previews'])
-    
-    total_checked = len(state_info['previews'])
-    
-    summary_lines = []
-    summary_lines.append("📊 **Cumulative Summary**")
-    summary_lines.append("─" * 25)
-    summary_lines.append(f"**Total previews checked:** {total_checked}")
-    summary_lines.append(f"**Total matches:** {len(all_matches)}")
-    summary_lines.append(f"**Total non-matches:** {len(all_non_matches)}")
-    
-    if stats['total'] > 0:
-        summary_lines.append(f"**Database size:** {stats['total']} messages")
-        summary_lines.append(f"**Match rate:** {len(all_matches)/total_checked*100:.1f}%")
-    
-    summary_lines.append("")
-    summary_lines.append("📝 **Send another message to check more previews**")
-    summary_lines.append("or use `/cancelpreview` to exit")
-    
-    await context.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=message_thread_id,
-        text="\n".join(summary_lines),
+        text=report_text,
         parse_mode='Markdown'
     )
 
@@ -649,7 +533,7 @@ class UserState:
     def has_active_tasks(self) -> bool:
         return self.processing or len(self.queue) > 0
     
-    def remove_task_by_name(self, filename: str):
+    def remove_task_by_name(filename: str):
         new_queue = deque(maxlen=MAX_QUEUE_SIZE)
         for task in self.queue:
             if task.get('name') != filename:
@@ -852,12 +736,11 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_sent += 1
                 
-                # Added: Delay between messages to prevent rate limiting
                 if i < len(chunks):
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for `{filename}`")
-                return False  # Stop on failure
+                return False
         
         state = get_user_state(chat_id)
         state.last_send = datetime.now(UTC_PLUS_1)
@@ -904,25 +787,24 @@ async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TY
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_in_part += 1
                 
-                # Added: Delay between messages to prevent rate limiting
                 if i < len(chunks):
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for part {part_num} of `{filename}`")
-                return 0  # Return 0 on failure
+                return 0
         
-        return total_messages_in_part  # Return actual count
+        return total_messages_in_part
         
     except Exception as e:
         logger.error(f"Error sending large content part: {e}")
-        return 0  # Return 0 on error
+        return 0
 
 async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                             parts: List[str], filename: str, state: UserState, 
                             message_thread_id: Optional[int] = None) -> bool:
     try:
         total_parts = len(parts)
-        total_messages_sent = 0  # Initialize total messages counter
+        total_messages_sent = 0
         
         for i, part in enumerate(parts, 1):
             if state.cancel_requested:
@@ -941,18 +823,17 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
                 chat_id, context, part, i, total_parts, filename, message_thread_id
             )
             
-            if not messages_in_part:  # Check for 0 (failure) instead of <= 0
+            if not messages_in_part:
                 logger.error(f"Failed to send part {i} of `{filename}`")
                 return False
             
-            total_messages_sent += messages_in_part  # Accumulate actual messages
+            total_messages_sent += messages_in_part
             
             state.last_send = datetime.now(UTC_PLUS_1)
             
             if i < total_parts:
                 await asyncio.sleep(SEND_INTERVAL * 60)
         
-        # Use actual messages count, not parts count
         completion_msg = await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
@@ -1050,7 +931,6 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     file_message_thread_id
                 )
             
-            # Always remove the file from queue after processing (success or failure)
             if state.queue and state.queue[0]['name'] == filename:
                 processed_file = state.queue.popleft()
                 processed_filename = processed_file['name']
@@ -1788,14 +1668,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        # Added timeout for file download to prevent "Timed out" error
         file = await context.bot.get_file(doc.file_id)
         
-        # Download with timeout
         try:
             file_bytes = await asyncio.wait_for(
                 file.download_as_bytearray(),
-                timeout=30.0  # 30 second timeout for file download
+                timeout=30.0
             )
         except asyncio.TimeoutError:
             await context.bot.send_message(
@@ -1932,31 +1810,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== PERIODIC CLEANUP TASK ====================
 async def periodic_cleanup_task():
-    """Periodically clean up old messages and expired admin preview sessions"""
+    """Periodically clean up old messages"""
     while True:
         try:
-            # Clean up old messages (72h)
             cleanup_old_messages()
-            
-            # Clean up expired admin preview sessions (2 hours)
-            current_time = datetime.now(UTC_PLUS_1)
-            expired_admins = []
-            
-            for user_id, state_info in admin_preview_mode.items():
-                # If session has been inactive for 2 hours, clean it up
-                if 'started_at' in state_info:
-                    if current_time - state_info['started_at'] > timedelta(hours=2):
-                        expired_admins.append(user_id)
-            
-            for user_id in expired_admins:
-                previews_checked = len(admin_preview_mode[user_id]['previews'])
-                del admin_preview_mode[user_id]
-                logger.info(f"Cleaned up expired admin preview session for user {user_id} (checked {previews_checked} previews)")
-            
             await asyncio.sleep(3600)  # Run every hour
         except Exception as e:
             logger.error(f"Error in periodic cleanup task: {e}")
-            await asyncio.sleep(300)  # Wait 5 minutes on error
+            await asyncio.sleep(300)
 
 # ==================== WEB SERVER & MAIN ====================
 async def health_handler(request):
