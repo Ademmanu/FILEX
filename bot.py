@@ -60,9 +60,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 file_history = defaultdict(list)
-file_message_mapping = {}
-file_notification_mapping = {}
-file_other_notifications = {}
+file_message_mapping = defaultdict(lambda: defaultdict(list))  # chat_id -> filename -> [message_ids]
+file_notification_mapping = defaultdict(dict)  # chat_id -> filename -> message_id
+file_other_notifications = defaultdict(lambda: defaultdict(list))  # chat_id -> filename -> [message_ids]
 
 # ==================== ADMIN PREVIEW SYSTEM ====================
 class MessageEntry:
@@ -128,7 +128,7 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
         entity_type = "Group" if is_group else "User"
         
         await context.bot.send_message(
-            chat_id=next(iter(ADMIN_IDS), ADMIN_USER_ID),
+            chat_id=next(iter(ADMIN_IDS), 6389552329),
             text=f"⚠️ **Unauthorized Access Attempt**\n\n"
                  f"**Entity Type:** {entity_type}\n"
                  f"**Chat ID:** `{chat_id}`\n"
@@ -543,7 +543,8 @@ class UserState:
     def has_active_tasks(self) -> bool:
         return self.processing or len(self.queue) > 0
     
-    def remove_task_by_name(filename: str):
+    def remove_task_by_name(self, filename: str):
+        """Remove task by filename from queue"""
         new_queue = deque(maxlen=MAX_QUEUE_SIZE)
         for task in self.queue:
             if task.get('name') != filename:
@@ -716,11 +717,9 @@ async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT
             
             if filename and sent_message:
                 if notification_type == 'content':
-                    if filename not in file_message_mapping:
-                        file_message_mapping[filename] = []
-                    file_message_mapping[filename].append(sent_message.message_id)
+                    file_message_mapping[chat_id][filename].append(sent_message.message_id)
                 elif notification_type == 'notification':
-                    file_notification_mapping[filename] = sent_message.message_id
+                    file_notification_mapping[chat_id][filename] = sent_message.message_id
             
             return True
         except Exception as e:
@@ -733,9 +732,7 @@ async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT
     return False
 
 async def track_other_notification(chat_id: int, filename: str, message_id: int):
-    if filename not in file_other_notifications:
-        file_other_notifications[filename] = []
-    file_other_notifications[filename].append(message_id)
+    file_other_notifications[chat_id][filename].append(message_id)
 
 async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                                 chunks: List[str], filename: str, message_thread_id: Optional[int] = None) -> bool:
@@ -864,13 +861,13 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         logger.error(f"Error in send_with_intervals: {e}")
         return False
 
-async def cleanup_completed_file(filename: str, chat_id: int):
-    if filename in file_message_mapping:
-        del file_message_mapping[filename]
-    if filename in file_notification_mapping:
-        del file_notification_mapping[filename]
-    if filename in file_other_notifications:
-        del file_other_notifications[filename]
+async def cleanup_completed_file(chat_id: int, filename: str):
+    if chat_id in file_message_mapping and filename in file_message_mapping[chat_id]:
+        del file_message_mapping[chat_id][filename]
+    if chat_id in file_notification_mapping and filename in file_notification_mapping[chat_id]:
+        del file_notification_mapping[chat_id][filename]
+    if chat_id in file_other_notifications and filename in file_other_notifications[chat_id]:
+        del file_other_notifications[chat_id][filename]
     
     logger.info(f"Cleaned up tracking for completed file: {filename} in chat {chat_id}")
 
@@ -947,6 +944,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                 
                 if success and not state.cancel_requested:
                     logger.info(f"Successfully processed `{processed_filename}` for chat {chat_id}")
+                    await cleanup_completed_file(chat_id, processed_filename)
                 else:
                     logger.error(f"Failed to process `{processed_filename}` for chat {chat_id}")
                     failed_msg = await context.bot.send_message(
@@ -1533,21 +1531,23 @@ async def process_file_deletion(chat_id: int, message_thread_id: Optional[int], 
     messages_to_delete = 0
     deleted_messages = []
     
-    if filename in file_message_mapping:
-        messages_to_delete += len(file_message_mapping[filename])
-        for msg_id in file_message_mapping[filename]:
+    # Delete content messages
+    if chat_id in file_message_mapping and filename in file_message_mapping[chat_id]:
+        messages_to_delete += len(file_message_mapping[chat_id][filename])
+        for msg_id in file_message_mapping[chat_id][filename]:
             try:
                 await context.bot.delete_message(
                     chat_id=chat_id,
                     message_id=msg_id
                 )
                 deleted_messages.append(msg_id)
-                logger.info(f"Deleted content message {msg_id} for file {filename}")
+                logger.info(f"Deleted content message {msg_id} for file {filename} in chat {chat_id}")
             except Exception as e:
                 logger.error(f"Failed to delete content message {msg_id}: {e}")
     
-    if filename in file_other_notifications:
-        for msg_id in file_other_notifications[filename]:
+    # Delete other notification messages
+    if chat_id in file_other_notifications and filename in file_other_notifications[chat_id]:
+        for msg_id in file_other_notifications[chat_id][filename]:
             try:
                 await context.bot.delete_message(
                     chat_id=chat_id,
@@ -1555,13 +1555,14 @@ async def process_file_deletion(chat_id: int, message_thread_id: Optional[int], 
                 )
                 messages_to_delete += 1
                 deleted_messages.append(msg_id)
-                logger.info(f"Deleted other notification message {msg_id} for file {filename}")
+                logger.info(f"Deleted other notification message {msg_id} for file {filename} in chat {chat_id}")
             except Exception as e:
                 logger.error(f"Failed to delete other notification message {msg_id}: {e}")
     
+    # Edit acceptance/queued notification
     notification_edited = False
-    if filename in file_notification_mapping:
-        notification_msg_id = file_notification_mapping[filename]
+    if chat_id in file_notification_mapping and filename in file_notification_mapping[chat_id]:
+        notification_msg_id = file_notification_mapping[chat_id][filename]
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
@@ -1573,15 +1574,17 @@ async def process_file_deletion(chat_id: int, message_thread_id: Optional[int], 
                 parse_mode='Markdown'
             )
             notification_edited = True
-            logger.info(f"Edited acceptance/queued notification for {filename}")
+            logger.info(f"Edited acceptance/queued notification for {filename} in chat {chat_id}")
         except Exception as e:
             logger.error(f"Failed to edit notification message: {e}")
     
     update_file_history(chat_id, filename, 'deleted')
     
+    # Remove task from queue
     state.remove_task_by_name(filename)
     
-    await context.bot.send_message(
+    # Send deletion confirmation
+    deletion_msg = await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=message_thread_id,
         text=f"🗑️ `{filename}` content deleted\n"
@@ -1591,6 +1594,15 @@ async def process_file_deletion(chat_id: int, message_thread_id: Optional[int], 
     
     state.waiting_for_filename = False
     
+    # Clean up file tracking
+    if chat_id in file_message_mapping and filename in file_message_mapping[chat_id]:
+        del file_message_mapping[chat_id][filename]
+    if chat_id in file_notification_mapping and filename in file_notification_mapping[chat_id]:
+        del file_notification_mapping[chat_id][filename]
+    if chat_id in file_other_notifications and filename in file_other_notifications[chat_id]:
+        del file_other_notifications[chat_id][filename]
+    
+    # Continue processing next task if needed
     if is_currently_processing and state.queue and not state.processing:
         next_file = state.queue[0].get('name', 'Unknown')
         await context.bot.send_message(
@@ -1617,15 +1629,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     state = get_user_state(chat_id)
     
-    # Check if admin is in preview mode
-    user_id = update.effective_user.id
-    if user_id in admin_preview_mode:
-        await handle_admin_preview_message(update, context)
-        return
-    
+    # Check if waiting for filename (deletion flow) - MUST CHECK THIS FIRST
     if state.waiting_for_filename:
         message_thread_id = update.effective_message.message_thread_id
         await process_file_deletion(chat_id, message_thread_id, update.message.text.strip(), context, state)
+        return
+    
+    # Check if admin is in preview mode (AFTER checking deletion flow)
+    user_id = update.effective_user.id
+    if user_id in admin_preview_mode:
+        await handle_admin_preview_message(update, context)
         return
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1769,7 +1782,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_notification=True,
                 parse_mode='Markdown'
             )
-            file_notification_mapping[file_name] = sent_msg.message_id
+            file_notification_mapping[chat_id][file_name] = sent_msg.message_id
             
             if not state.processing:
                 state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
@@ -1797,7 +1810,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_notification=True,
                 parse_mode='Markdown'
             )
-            file_notification_mapping[file_name] = sent_msg.message_id
+            file_notification_mapping[chat_id][file_name] = sent_msg.message_id
             
     except asyncio.TimeoutError:
         logger.error(f"File processing timeout for {file_name}")
