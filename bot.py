@@ -308,7 +308,7 @@ def format_preview_report_exact(matches: List[str], non_matches: List[str],
     """Format the preview report exactly like the example provided"""
     
     if total_previews == 0:
-        return "❌ **No preview content found**\n\nNo valid preview sections found in the message."
+        return "❌ **No preview content found**\n\nNo valid preview sections found in the message.\n\nUse /cancelpreview to cancel."
     
     report_lines = []
     report_lines.append("📊 **Preview Analysis Report**")
@@ -335,7 +335,10 @@ def format_preview_report_exact(matches: List[str], non_matches: List[str],
         report_lines.append("⚠️ **Not found in database:**")
         for i, non_match in enumerate(non_matches, 1):
             report_lines.append(f"{i}. {non_match}")
-    
+
+    report_lines.append("")
+    report_lines.append("Use /cancelpreview to cancel.")
+                                   
     return "\n".join(report_lines)
 
 # ==================== ADMIN COMMANDS ====================
@@ -351,10 +354,14 @@ async def adminpreview_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         message_thread_id=update.effective_message.message_thread_id,
-        text="🔍 **Preview Mode Activated**\n\n"
-             "Send any message with preview content to check.\n"
-             "Each message will be analyzed independently.\n"
-             "Use `/cancelpreview` to exit preview mode.",
+        text="🔍 **Admin Preview Mode Activated**\n\n"
+             "Please send the report data with 'Preview:' sections.\n"
+             "Example format:\n"
+             "```\n"
+             "Preview: 97699115546 97699115547\n"
+             "Preview: 237620819778 237620819780\n"
+             "```\n\n"
+             "Use /cancelpreview to cancel.",
         parse_mode='Markdown'
     )
 
@@ -446,7 +453,7 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
             chat_id=chat_id,
             message_thread_id=message_thread_id,
             text="⚠️ **Empty message**\n"
-                 "Please send a message with preview content to check.",
+                 "Please send a message with preview content to check.\n\nUse /cancelpreview to cancel.",
             parse_mode='Markdown'
         )
         return
@@ -463,7 +470,8 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
                  "Please use the exact format:\n"
                  "```\n"
                  "📝 Preview: [content]\n"
-                 "```",
+                 "```\n\n"
+             "Use /cancelpreview to cancel.",
             parse_mode='Markdown'
         )
         return
