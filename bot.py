@@ -83,7 +83,7 @@ class MessageEntry:
 # Global storage for message tracking
 message_tracking: List[MessageEntry] = []
 MAX_TRACKED_MESSAGES = 1000  # Maximum messages to track
-admin_preview_mode: Dict[int, Dict[str, any]] = {}  # admin_user_id -> {state, data, report_type}
+admin_preview_mode: Dict[int, Dict[str, any]] = {}  # admin_user_id -> {state, previews}
 
 # ==================== FILE HISTORY FUNCTIONS ====================
 def update_file_history(chat_id: int, filename: str, status: str, parts_count: int = 0, messages_count: int = 0):
@@ -257,7 +257,7 @@ def extract_preview_sections(text: str) -> List[str]:
     preview_sections = []
     
     # Pattern to match "Preview: " followed by content (until end of line or next section)
-    pattern = r'[Pp]review:\s*(.+?)(?=\n\s*(?:🕒|📝|📊|$))'
+    pattern = r'[Pp]review:\s*(.+?)(?=\n\s*(?:🕒|📝|📊|Preview:|$))'
     
     matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
     
@@ -269,13 +269,45 @@ def extract_preview_sections(text: str) -> List[str]:
     
     return preview_sections
 
-def check_preview_against_database(preview_texts: List[str], report_type: str) -> Tuple[List[str], List[str]]:
+def extract_preview_from_any_message(text: str) -> List[str]:
+    """Extract preview from any message format - try multiple patterns"""
+    previews = []
+    
+    # Pattern 1: Standard "Preview: content" format
+    pattern1 = r'[Pp]review:\s*(.+?)(?=\n\s*(?:🕒|📝|📊|Preview:|$))'
+    matches1 = re.findall(pattern1, text, re.DOTALL | re.IGNORECASE)
+    
+    # Pattern 2: Content that looks like numbers or words (for direct messages)
+    if not matches1:
+        # Look for lines that contain sequences that look like preview content
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith(('🕒', '📝', '📊', '👤', '━━')):
+                # Check if line looks like preview content (numbers, words, etc.)
+                if re.match(r'^[\d\w\s]+$', line) and len(line) > 3:
+                    previews.append(line)
+    
+    if matches1:
+        previews.extend([match.strip() for match in matches1 if match.strip()])
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_previews = []
+    for preview in previews:
+        if preview not in seen:
+            seen.add(preview)
+            unique_previews.append(preview)
+    
+    return unique_previews
+
+def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str], List[str]]:
     """
     Check preview texts against tracked messages
     Returns: (matches, non_matches)
     """
     if not message_tracking:
-        return ([], preview_texts) if report_type == 'matches' else (preview_texts, [])
+        return ([], preview_texts)
     
     # Get all unique first_two_words from database
     tracked_words = {entry.first_two_words for entry in message_tracking}
@@ -287,15 +319,12 @@ def check_preview_against_database(preview_texts: List[str], report_type: str) -
         # Extract first two words from preview text
         preview_words = extract_first_two_words(preview)
         
-        if preview_words in tracked_words:
+        if preview_words and preview_words in tracked_words:
             matches.append(preview)
         else:
             non_matches.append(preview)
     
-    if report_type == 'matches':
-        return (matches, non_matches)
-    else:  # 'non_matches'
-        return (non_matches, matches)
+    return (matches, non_matches)
 
 def format_preview_report(matches: List[str], non_matches: List[str], 
                          total_previews: int, stats: Dict[str, any]) -> str:
@@ -311,8 +340,8 @@ def format_preview_report(matches: List[str], non_matches: List[str],
     report_lines.append("─" * 30)
     
     # Statistics
-    report_lines.append(f"📈 **Statistics:**")
-    report_lines.append(f"• Database entries: {stats['total']}")
+    report_lines.append(f"📈 **Database Statistics:**")
+    report_lines.append(f"• Total entries: {stats['total']}")
     report_lines.append(f"• Unique word pairs: {stats['unique_words']}")
     report_lines.append(f"• Oldest entry: {stats['oldest'].strftime('%H:%M:%S')}")
     report_lines.append(f"• Newest entry: {stats['newest'].strftime('%H:%M:%S')}")
@@ -327,25 +356,30 @@ def format_preview_report(matches: List[str], non_matches: List[str],
     # Matches section
     if matches:
         report_lines.append("")
-        report_lines.append("✅ **Matches found in database:**")
-        for i, match in enumerate(matches[:10], 1):  # Show first 10 matches
-            report_lines.append(f"{i}. `{match[:50]}{'...' if len(match) > 50 else ''}`")
-        
-        if len(matches) > 10:
-            report_lines.append(f"... and {len(matches) - 10} more")
+        report_lines.append("✅ **MATCHES FOUND:**")
+        for i, match in enumerate(matches, 1):
+            truncated = match[:40] + "..." if len(match) > 40 else match
+            report_lines.append(f"{i}. `{truncated}`")
     else:
         report_lines.append("")
-        report_lines.append("❌ **No matches found in database**")
+        report_lines.append("❌ **NO MATCHES FOUND**")
+        report_lines.append("None of the previews were found in the database.")
     
     # Non-matches section  
     if non_matches:
         report_lines.append("")
-        report_lines.append("⚠️ **Not found in database:**")
-        for i, non_match in enumerate(non_matches[:5], 1):  # Show first 5 non-matches
-            report_lines.append(f"{i}. `{non_match[:50]}{'...' if len(non_match) > 50 else ''}`")
+        report_lines.append("⚠️ **NON-MATCHES:**")
+        for i, non_match in enumerate(non_matches[:10], 1):  # Show first 10 non-matches
+            truncated = non_match[:40] + "..." if len(non_match) > 40 else non_match
+            report_lines.append(f"{i}. `{truncated}`")
         
-        if len(non_matches) > 5:
-            report_lines.append(f"... and {len(non_matches) - 5} more")
+        if len(non_matches) > 10:
+            report_lines.append(f"... and {len(non_matches) - 10} more")
+    
+    report_lines.append("")
+    report_lines.append("📝 **Next Steps:**")
+    report_lines.append("• Send another message with previews to check")
+    report_lines.append("• Use `/cancelpreview` to exit preview mode")
     
     return "\n".join(report_lines)
 
@@ -361,24 +395,27 @@ async def adminpreview_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Initialize preview mode for this admin
     admin_preview_mode[user_id] = {
-        'state': 'waiting_for_report',
-        'data': None,
-        'report_type': None,
+        'previews': [],
         'chat_id': chat_id,
-        'message_thread_id': message_thread_id
+        'message_thread_id': message_thread_id,
+        'started_at': datetime.now(UTC_PLUS_1)
     }
     
     await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=message_thread_id,
-        text="🔍 **Admin Preview Mode Activated**\n\n"
-             "Please send the report data with 'Preview:' sections.\n"
-             "Example format:\n"
-             "```\n"
-             "Preview: 97699115546 97699115547\n"
-             "Preview: 237620819778 237620819780\n"
-             "```\n\n"
-             "Send /cancelpreview to cancel.",
+        text="🔍 **Admin Preview Mode ACTIVATED**\n\n"
+             "📝 **How it works:**\n"
+             "1. Send any message with preview content\n"
+             "2. Bot will automatically extract and check previews\n"
+             "3. Shows matches AND non-matches\n"
+             "4. Continue sending messages to check more previews\n"
+             "5. Use `/cancelpreview` to exit\n\n"
+             "📋 **Accepted formats:**\n"
+             "• Full reports with 'Preview:' lines\n"
+             "• Direct preview content (numbers, words)\n"
+             "• Any message containing text to check\n\n"
+             "✅ **Ready for your first preview message!**",
         parse_mode='Markdown'
     )
 
@@ -389,14 +426,27 @@ async def cancelpreview_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     user_id = update.effective_user.id
     
-    if user_id in admin_preview_mode:
-        del admin_preview_mode[user_id]
+    if user_id not in admin_preview_mode:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            message_thread_id=update.effective_message.message_thread_id,
+            text="ℹ️ **Not in preview mode**\n"
+                 "Use `/adminpreview` to start preview mode.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Get stats before clearing
+    previews_checked = len(admin_preview_mode[user_id]['previews'])
+    
+    del admin_preview_mode[user_id]
     
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         message_thread_id=update.effective_message.message_thread_id,
-        text="🚫 **Preview Mode Cancelled**\n\n"
-             "Stopped tracking messages for preview analysis.",
+        text=f"🚫 **Preview Mode CANCELLED**\n\n"
+             f"Checked {previews_checked} previews in total.\n"
+             f"Preview mode has been deactivated.",
         parse_mode='Markdown'
     )
 
@@ -421,16 +471,22 @@ async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     oldest_str = stats['oldest'].strftime('%Y-%m-%d %H:%M:%S')
     newest_str = stats['newest'].strftime('%Y-%m-%d %H:%M:%S')
     
+    # Count active preview sessions
+    active_sessions = len([uid for uid in admin_preview_mode.keys() if uid in ADMIN_IDS])
+    
+    message = f"📊 **Message Tracking Statistics**\n\n"
+    message += f"**Total tracked messages:** {stats['total']}\n"
+    message += f"**Unique word pairs:** {stats['unique_words']}\n"
+    message += f"**Oldest entry:** {oldest_str}\n"
+    message += f"**Newest entry:** {newest_str}\n"
+    message += f"**Expires in:** {stats['expires_in']}\n"
+    message += f"**Active preview sessions:** {active_sessions}\n\n"
+    message += f"Messages auto-delete after 72 hours."
+    
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         message_thread_id=update.effective_message.message_thread_id,
-        text=f"📊 **Message Tracking Statistics**\n\n"
-             f"**Total tracked messages:** {stats['total']}\n"
-             f"**Unique word pairs:** {stats['unique_words']}\n"
-             f"**Oldest entry:** {oldest_str}\n"
-             f"**Newest entry:** {newest_str}\n"
-             f"**Expires in:** {stats['expires_in']}\n\n"
-             f"Messages auto-delete after 72 hours.",
+        text=message,
         parse_mode='Markdown'
     )
 
@@ -442,119 +498,104 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
         return
     
     state_info = admin_preview_mode[user_id]
+    chat_id = state_info['chat_id']
+    message_thread_id = state_info['message_thread_id']
     
-    if state_info['state'] == 'waiting_for_report':
-        # Admin sent the report data
-        report_text = update.message.text
-        
-        # Extract preview sections
-        preview_sections = extract_preview_sections(report_text)
-        
-        if not preview_sections:
-            await context.bot.send_message(
-                chat_id=state_info['chat_id'],
-                message_thread_id=state_info['message_thread_id'],
-                text="❌ **No valid preview content found**\n\n"
-                     "Please send a report with 'Preview:' sections.\n"
-                     "Example:\n"
-                     "```\n"
-                     "Preview: 97699115546 97699115547\n"
-                     "Preview: 237620819778 237620819780\n"
-                     "```",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Store the preview sections
-        state_info['data'] = preview_sections
-        state_info['state'] = 'waiting_for_report_type'
-        
-        # Ask for report type
-        keyboard = [
-            [
-                InlineKeyboardButton("📈 Report Matches", callback_data="admin_report_matches"),
-                InlineKeyboardButton("📉 Report Non-Matches", callback_data="admin_report_non_matches")
-            ],
-            [
-                InlineKeyboardButton("❌ Cancel", callback_data="admin_report_cancel")
-            ]
-        ]
-        
+    # Extract previews from the message
+    message_text = update.message.text
+    if not message_text or not message_text.strip():
         await context.bot.send_message(
-            chat_id=state_info['chat_id'],
-            message_thread_id=state_info['message_thread_id'],
-            text=f"✅ **Found {len(preview_sections)} preview sections**\n\n"
-                 "Please select report type:\n"
-                 "• **Report Matches**: Show which previews exist in database\n"
-                 "• **Report Non-Matches**: Show which previews don't exist in database\n\n"
-                 f"First preview: `{preview_sections[0][:50]}{'...' if len(preview_sections[0]) > 50 else ''}`",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-
-async def handle_admin_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin preview callback queries"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    
-    if user_id not in admin_preview_mode:
-        return
-    
-    state_info = admin_preview_mode[user_id]
-    
-    if query.data == "admin_report_cancel":
-        del admin_preview_mode[user_id]
-        await query.edit_message_text(
-            text="🚫 **Preview Cancelled**",
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text="⚠️ **Empty message**\n"
+                 "Please send a message with preview content to check.",
             parse_mode='Markdown'
         )
         return
     
-    if query.data == "admin_report_matches":
-        report_type = 'matches'
-    elif query.data == "admin_report_non_matches":
-        report_type = 'non_matches'
-    else:
-        return
+    # Extract previews using flexible extraction
+    new_previews = extract_preview_from_any_message(message_text)
     
-    preview_sections = state_info['data']
-    
-    if not preview_sections:
-        await query.edit_message_text(
-            text="❌ **No preview data to analyze**",
+    if not new_previews:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text="❌ **No preview content found**\n\n"
+                 "I couldn't find any preview content in your message.\n"
+                 "Try sending:\n"
+                 "• Messages with 'Preview:' lines\n"
+                 "• Direct preview content like '97699115546 97699115547'\n"
+                 "• Any text you want to check against the database",
             parse_mode='Markdown'
         )
-        del admin_preview_mode[user_id]
         return
+    
+    # Add to collected previews
+    state_info['previews'].extend(new_previews)
     
     # Check against database
-    matches, non_matches = check_preview_against_database(preview_sections, report_type)
+    matches, non_matches = check_preview_against_database(new_previews)
     
     # Get statistics
     stats = get_tracking_stats()
     
-    # Format report
-    report_text = format_preview_report(
-        matches, non_matches, len(preview_sections), stats
-    )
+    # Format immediate report for this batch
+    report_lines = []
     
-    # Send report
+    if stats['total'] == 0:
+        report_lines.append("⚠️ **Database is empty**")
+        report_lines.append("No messages have been tracked yet.")
+        report_lines.append(f"Found {len(new_previews)} previews in your message.")
+    else:
+        report_lines.append(f"🔍 **Batch Analysis**")
+        report_lines.append(f"Preview batch size: {len(new_previews)}")
+        report_lines.append(f"• Matches: {len(matches)}")
+        report_lines.append(f"• Non-matches: {len(non_matches)}")
+        
+        if matches:
+            report_lines.append("")
+            report_lines.append("✅ **Batch Matches:**")
+            for i, match in enumerate(matches[:3], 1):
+                truncated = match[:35] + "..." if len(match) > 35 else match
+                report_lines.append(f"{i}. `{truncated}`")
+            if len(matches) > 3:
+                report_lines.append(f"... and {len(matches) - 3} more")
+    
+    # Send immediate batch report
     await context.bot.send_message(
-        chat_id=state_info['chat_id'],
-        message_thread_id=state_info['message_thread_id'],
-        text=report_text,
+        chat_id=chat_id,
+        message_thread_id=message_thread_id,
+        text="\n".join(report_lines),
         parse_mode='Markdown'
     )
     
-    # Cleanup
-    del admin_preview_mode[user_id]
+    # Send full summary after a short delay
+    await asyncio.sleep(0.5)
     
-    # Edit the original message
-    await query.edit_message_text(
-        text=f"✅ **Analysis Complete**\n\n"
-             f"Report sent. Checked {len(preview_sections)} preview sections.",
+    # Check all accumulated previews
+    all_matches, all_non_matches = check_preview_against_database(state_info['previews'])
+    
+    total_checked = len(state_info['previews'])
+    
+    summary_lines = []
+    summary_lines.append("📊 **Cumulative Summary**")
+    summary_lines.append("─" * 25)
+    summary_lines.append(f"**Total previews checked:** {total_checked}")
+    summary_lines.append(f"**Total matches:** {len(all_matches)}")
+    summary_lines.append(f"**Total non-matches:** {len(all_non_matches)}")
+    
+    if stats['total'] > 0:
+        summary_lines.append(f"**Database size:** {stats['total']} messages")
+        summary_lines.append(f"**Match rate:** {len(all_matches)/total_checked*100:.1f}%")
+    
+    summary_lines.append("")
+    summary_lines.append("📝 **Send another message to check more previews**")
+    summary_lines.append("or use `/cancelpreview` to exit")
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=message_thread_id,
+        text="\n".join(summary_lines),
         parse_mode='Markdown'
     )
 
@@ -1140,11 +1181,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Check if this is an admin preview callback
-    if query.data.startswith("admin_report_"):
-        await handle_admin_preview_callback(update, context)
-        return
-    
     message_thread_id = query.message.message_thread_id
     state = get_user_state(chat_id)
     operation = query.data
@@ -1693,7 +1729,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Check if admin is in preview mode
     user_id = update.effective_user.id
-    if user_id in admin_preview_mode and admin_preview_mode[user_id]['state'] == 'waiting_for_report':
+    if user_id in admin_preview_mode:
         await handle_admin_preview_message(update, context)
         return
     
@@ -1902,19 +1938,20 @@ async def periodic_cleanup_task():
             # Clean up old messages (72h)
             cleanup_old_messages()
             
-            # Clean up expired admin preview sessions (30 minutes)
+            # Clean up expired admin preview sessions (2 hours)
             current_time = datetime.now(UTC_PLUS_1)
             expired_admins = []
             
             for user_id, state_info in admin_preview_mode.items():
-                # If session has been inactive for 30 minutes, clean it up
-                if 'created_at' in state_info:
-                    if current_time - state_info['created_at'] > timedelta(minutes=30):
+                # If session has been inactive for 2 hours, clean it up
+                if 'started_at' in state_info:
+                    if current_time - state_info['started_at'] > timedelta(hours=2):
                         expired_admins.append(user_id)
             
             for user_id in expired_admins:
+                previews_checked = len(admin_preview_mode[user_id]['previews'])
                 del admin_preview_mode[user_id]
-                logger.info(f"Cleaned up expired admin preview session for user {user_id}")
+                logger.info(f"Cleaned up expired admin preview session for user {user_id} (checked {previews_checked} previews)")
             
             await asyncio.sleep(3600)  # Run every hour
         except Exception as e:
@@ -1986,7 +2023,7 @@ async def main():
     application.add_handler(CommandHandler("cancelpreview", cancelpreview_command))
     application.add_handler(CommandHandler("adminstats", adminstats_command))
     
-    # Add callback query handler
+    # Add callback query handler (only for operation selection)
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Add message handlers
