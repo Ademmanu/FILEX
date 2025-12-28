@@ -35,6 +35,7 @@ TELEGRAM_MESSAGE_LIMIT = 4050
 CONTENT_LIMIT_FOR_INTERVALS = 60000
 SEND_INTERVAL = 3.5
 MESSAGE_DELAY = 0.5  # Added: Delay between messages in seconds
+QUEUE_INTERVAL = 2 * 60  # Added: 2-minute interval between files in seconds
 
 ALLOWED_USERS_STR = os.getenv('ALLOWED_USERS', '6389552329')
 ALLOWED_IDS = set()
@@ -976,6 +977,24 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
             state.current_parts = []
             state.current_index = 0
             
+            # Wait 2 minutes before processing next file (if any remain)
+            if state.queue and not state.cancel_requested:
+                next_file = state.queue[0]['name']
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    text=f"⏰ **Queue Interval**\n\n"
+                         f"Next file `{next_file}` will start in 2 minutes...",
+                    parse_mode='Markdown'
+                )
+                
+                # Wait for QUEUE_INTERVAL seconds
+                wait_start = datetime.now(UTC_PLUS_1)
+                while (datetime.now(UTC_PLUS_1) - wait_start).seconds < QUEUE_INTERVAL:
+                    if state.cancel_requested:
+                        break
+                    await asyncio.sleep(1)
+            
             if state.cancel_requested:
                 break
                 
@@ -1014,7 +1033,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_thread_id=message_thread_id,
         text="🤖 **FileX Bot**\n\n"
         f"📝 **Current operation:** {state.operation.capitalize()} content\n"
-        f"📊 **Queue:** {max(0, len(state.queue) - 1) if state.processing else len(state.queue)}/{MAX_QUEUE_SIZE} files\n\n"
+        f"📊 **Queue:** {max(0, len(state.queue) - 1) if state.processing else len(state.queue)}/{MAX_QUEUE_SIZE} files\n"
+        f"⏰ **Queue interval:** {QUEUE_INTERVAL // 60} minutes between files\n\n"
         "📁 **Supported files:** TXT, CSV\n\n"
         "🛠 **Operations available:**\n"
         "• All content - Send file as-is\n"
@@ -1144,6 +1164,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_send_str = state.last_send.strftime('%H:%M:%S')
             status_lines.append(f"⏱ **Last send time:** {last_send_str}")
     
+    status_lines.append(f"⏰ **Queue interval:** {QUEUE_INTERVAL // 60} minutes between files")
+    
     await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=message_thread_id,
@@ -1250,6 +1272,8 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if len(state.queue) >= MAX_QUEUE_SIZE:
         queue_text += f"\n⚠️ **Queue is full** ({MAX_QUEUE_SIZE}/{MAX_QUEUE_SIZE} files)"
+    
+    queue_text += f"\n⏰ **Queue interval:** {QUEUE_INTERVAL // 60} minutes between files"
     
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1803,8 +1827,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ File queued: `{file_name}`\n"
                 f"Size: {content_size:,} characters{parts_info}\n"
                 f"Operation: {state.operation.capitalize()}\n"
-                f"Position in queue: {queue_position}\n\n"
-                f"Will begin immediately after the ongoing task is completed"
+                f"Position in queue: {queue_position}\n"
+                f"Queue interval: {QUEUE_INTERVAL // 60} minutes between files\n\n"
             )
             
             sent_msg = await context.bot.send_message(
