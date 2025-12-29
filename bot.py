@@ -525,9 +525,9 @@ class UserState:
         self.paused_at = None
         self.paused_progress = None
         
-        # NEW: Synchronization primitives for handling simultaneous uploads
-        self.upload_lock = asyncio.Lock()  # Lock for upload operations
-        self.processing_lock = asyncio.Lock()  # Lock for processing state
+        # Add locks to prevent concurrent processing
+        self.queue_lock = asyncio.Lock()
+        self.processing_lock = asyncio.Lock()
         
     def pause(self):
         self.paused = True
@@ -566,20 +566,6 @@ class UserState:
             if task.get('name') != filename:
                 new_queue.append(task)
         self.queue = new_queue
-    
-    # NEW: Thread-safe queue operations
-    async def safe_queue_append(self, file_info: dict) -> Tuple[bool, Optional[str]]:
-        """Thread-safe queue append operation"""
-        async with self.upload_lock:
-            if len(self.queue) >= MAX_QUEUE_SIZE:
-                return False, "Queue full"
-            self.queue.append(file_info)
-            return True, None
-    
-    async def safe_get_queue_status(self) -> Tuple[int, int]:
-        """Thread-safe queue status check"""
-        async with self.upload_lock:
-            return len(self.queue), MAX_QUEUE_SIZE
 
 user_states: Dict[int, UserState] = {}
 
@@ -770,7 +756,23 @@ async def track_other_notification(chat_id: int, filename: str, message_id: int)
 async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                                 chunks: List[str], filename: str, message_thread_id: Optional[int] = None) -> bool:
     try:
+        # Add timeout for entire file sending
+        return await asyncio.wait_for(
+            _actual_send_chunks_immediately(chat_id, context, chunks, filename, message_thread_id),
+            timeout=1800  # 30 minute timeout per file
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout sending chunks for {filename}")
+        return False
+    except Exception as e:
+        logger.error(f"Error in send_chunks_immediately: {e}")
+        return False
+
+async def _actual_send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
+                                        chunks: List[str], filename: str, message_thread_id: Optional[int] = None) -> bool:
+    try:
         total_messages_sent = 0
+        total_chunks = len(chunks)
         
         for i, chunk in enumerate(chunks, 1):
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
@@ -780,13 +782,15 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
                 if i < len(chunks):
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
-                logger.error(f"Failed to send chunk {i} for `{filename}`")
-                return False  # Stop on failure
+                logger.error(f"Failed to send chunk {i}/{total_chunks} for `{filename}`")
+                # Continue trying to send remaining chunks instead of stopping immediately
+                continue
         
         state = get_user_state(chat_id)
         state.last_send = datetime.now(UTC_PLUS_1)
         
-        if total_messages_sent > 0:
+        # Only mark as completed if ALL chunks were sent successfully
+        if total_messages_sent == total_chunks:
             completion_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
@@ -799,11 +803,22 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
             update_file_history(chat_id, filename, 'completed', messages_count=total_messages_sent)
             return True
         else:
-            logger.error(f"No chunks sent for `{filename}`")
+            logger.error(f"Partial failure for `{filename}`: {total_messages_sent}/{total_chunks} chunks sent")
+            failed_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"❌ Partial failure: `{filename}`\n"
+                     f"Sent {total_messages_sent} of {total_chunks} messages\n"
+                     f"Please try uploading again.",
+                disable_notification=True,
+                parse_mode='Markdown'
+            )
+            await track_other_notification(chat_id, filename, failed_msg.message_id)
+            update_file_history(chat_id, filename, 'failed', messages_count=total_messages_sent)
             return False
         
     except Exception as e:
-        logger.error(f"Error in send_chunks_immediately: {e}")
+        logger.error(f"Error in _actual_send_chunks_immediately: {e}")
         return False
 
 async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
@@ -844,6 +859,22 @@ async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TY
 async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                             parts: List[str], filename: str, state: UserState, 
                             message_thread_id: Optional[int] = None) -> bool:
+    try:
+        # Add timeout for entire file processing
+        return await asyncio.wait_for(
+            _actual_send_with_intervals(chat_id, context, parts, filename, state, message_thread_id),
+            timeout=3600  # 1 hour timeout per file
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout processing file {filename}")
+        return False
+    except Exception as e:
+        logger.error(f"Error in send_with_intervals: {e}")
+        return False
+
+async def _actual_send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
+                                    parts: List[str], filename: str, state: UserState, 
+                                    message_thread_id: Optional[int] = None) -> bool:
     try:
         total_parts = len(parts)
         total_messages_sent = 0  # Initialize total messages counter
@@ -894,7 +925,7 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         logger.info(f"Task cancelled for chat {chat_id}")
         raise
     except Exception as e:
-        logger.error(f"Error in send_with_intervals: {e}")
+        logger.error(f"Error in _actual_send_with_intervals: {e}")
         return False
 
 async def cleanup_completed_file(filename: str, chat_id: int):
@@ -907,68 +938,83 @@ async def cleanup_completed_file(filename: str, chat_id: int):
     
     logger.info(f"Cleaned up tracking for completed file: {filename} in chat {chat_id}")
 
+def validate_queue_state(state: UserState) -> bool:
+    """Validate queue state is consistent"""
+    if state.processing and not state.queue:
+        logger.warning(f"Inconsistent state for chat {state.chat_id}: processing=True but queue empty")
+        state.processing = False
+        state.current_parts = []
+        state.current_index = 0
+        return False
+    
+    if state.current_parts and not state.processing:
+        logger.warning(f"Inconsistent state for chat {state.chat_id}: current_parts set but not processing")
+        state.current_parts = []
+        state.current_index = 0
+        return False
+    
+    return True
+
 async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, message_thread_id: Optional[int] = None):
     state = get_user_state(chat_id)
     
-    # NEW: Use processing lock to prevent multiple concurrent processing tasks
+    # Use lock to prevent concurrent processing
     async with state.processing_lock:
         if state.processing:
             return
         
+        # Validate state before starting
+        if not validate_queue_state(state):
+            logger.info(f"Fixed inconsistent state for chat {chat_id}")
+        
         state.processing = True
-    
-    state.cancel_requested = False
-    state.paused = False
-    
-    try:
-        while state.queue and not state.cancel_requested:
-            while state.paused and not state.cancel_requested:
-                await asyncio.sleep(1)
-            
-            if state.cancel_requested:
-                break
+        state.cancel_requested = False
+        state.paused = False
+        
+        try:
+            while state.queue and not state.cancel_requested:
+                # Validate state on each iteration
+                validate_queue_state(state)
                 
-            # NEW: Safe queue access with lock
-            async with state.upload_lock:
-                if not state.queue:
+                while state.paused and not state.cancel_requested:
+                    await asyncio.sleep(1)
+                
+                if state.cancel_requested:
                     break
+                    
                 file_info = state.queue[0]
                 filename = file_info['name']
                 file_message_thread_id = file_info.get('message_thread_id', message_thread_id)
-            
-            if file_info.get('requires_intervals', False):
-                update_file_history(chat_id, filename, 'running', parts_count=len(file_info['parts']))
-            else:
-                update_file_history(chat_id, filename, 'running', messages_count=len(file_info['chunks']))
-            
-            # NEW: Safe notification sending with error handling
-            try:
+                
                 if file_info.get('requires_intervals', False):
-                    sending_msg = await context.bot.send_message(
-                        chat_id=chat_id,
-                        message_thread_id=file_message_thread_id,
-                        text=f"📤 Sending: `{filename}`\n"
-                             f"📊 Total parts: {len(file_info['parts'])}\n"
-                             f"⏰ Interval: {SEND_INTERVAL} minutes between parts",
-                        disable_notification=True,
-                        parse_mode='Markdown'
-                    )
-                    await track_other_notification(chat_id, filename, sending_msg.message_id)
+                    update_file_history(chat_id, filename, 'running', parts_count=len(file_info['parts']))
                 else:
-                    sending_msg = await context.bot.send_message(
-                        chat_id=chat_id,
-                        message_thread_id=file_message_thread_id,
-                        text=f"📤 Sending: `{filename}`\n"
-                             f"📊 Total messages: {len(file_info['chunks'])}",
-                        disable_notification=True,
-                        parse_mode='Markdown'
-                    )
-                    await track_other_notification(chat_id, filename, sending_msg.message_id)
-            except Exception as e:
-                logger.error(f"Failed to send notification for {filename}: {e}")
-            
-            success = False
-            try:
+                    update_file_history(chat_id, filename, 'running', messages_count=len(file_info['chunks']))
+                
+                if len(state.queue) > 0 and state.queue[0] == file_info:
+                    if file_info.get('requires_intervals', False):
+                        sending_msg = await context.bot.send_message(
+                            chat_id=chat_id,
+                            message_thread_id=file_message_thread_id,
+                            text=f"📤 Sending: `{filename}`\n"
+                                 f"📊 Total parts: {len(file_info['parts'])}\n"
+                                 f"⏰ Interval: {SEND_INTERVAL} minutes between parts",
+                            disable_notification=True,
+                            parse_mode='Markdown'
+                        )
+                        await track_other_notification(chat_id, filename, sending_msg.message_id)
+                    else:
+                        sending_msg = await context.bot.send_message(
+                            chat_id=chat_id,
+                            message_thread_id=file_message_thread_id,
+                            text=f"📤 Sending: `{filename}`\n"
+                                 f"📊 Total messages: {len(file_info['chunks'])}",
+                            disable_notification=True,
+                            parse_mode='Markdown'
+                        )
+                        await track_other_notification(chat_id, filename, sending_msg.message_id)
+                
+                success = False
                 if file_info.get('requires_intervals', False):
                     success = await send_with_intervals(
                         chat_id, context, 
@@ -984,51 +1030,41 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                         filename,
                         file_message_thread_id
                     )
-            except Exception as e:
-                logger.error(f"Error processing file {filename}: {e}")
-                success = False
-            
-            # NEW: Safe queue removal
-            async with state.upload_lock:
+                
+                # Always remove the file from queue after processing (success or failure)
                 if state.queue and state.queue[0]['name'] == filename:
                     processed_file = state.queue.popleft()
                     processed_filename = processed_file['name']
                     
                     if success and not state.cancel_requested:
                         logger.info(f"Successfully processed `{processed_filename}` for chat {chat_id}")
+                        await cleanup_completed_file(processed_filename, chat_id)
                     else:
                         logger.error(f"Failed to process `{processed_filename}` for chat {chat_id}")
-                        try:
-                            failed_msg = await context.bot.send_message(
-                                chat_id=chat_id,
-                                message_thread_id=file_message_thread_id,
-                                text=f"❌ Failed to send: `{processed_filename}`\nPlease try uploading again.",
-                                disable_notification=True,
-                                parse_mode='Markdown'
-                            )
-                            await track_other_notification(chat_id, processed_filename, failed_msg.message_id)
-                        except Exception as e:
-                            logger.error(f"Failed to send failure notification: {e}")
-            
-            state.current_parts = []
-            state.current_index = 0
-            
-            # Wait 2 minutes before processing next file (if any remain)
-            if state.queue and not state.cancel_requested:
-                async with state.upload_lock:
-                    next_file = state.queue[0]['name'] if state.queue else None
-                
-                if next_file:
-                    try:
-                        await context.bot.send_message(
+                        failed_msg = await context.bot.send_message(
                             chat_id=chat_id,
-                            message_thread_id=message_thread_id,
-                            text=f"⏰ **Queue Interval**\n\n"
-                                 f"Next file `{next_file}` will start in 2 minutes...",
+                            message_thread_id=file_message_thread_id,
+                            text=f"❌ Failed to send: `{processed_filename}`\nPlease try uploading again.",
+                            disable_notification=True,
                             parse_mode='Markdown'
                         )
-                    except Exception as e:
-                        logger.error(f"Failed to send queue interval notification: {e}")
+                        await track_other_notification(chat_id, processed_filename, failed_msg.message_id)
+                        update_file_history(chat_id, processed_filename, 'failed')
+                
+                state.current_parts = []
+                state.current_index = 0
+                
+                # Wait 2 minutes before processing next file (if any remain)
+                if state.queue and not state.cancel_requested:
+                    next_file = state.queue[0]['name']
+                    wait_msg = await context.bot.send_message(
+                        chat_id=chat_id,
+                        message_thread_id=message_thread_id,
+                        text=f"⏰ **Queue Interval**\n\n"
+                             f"Next file `{next_file}` will start in 2 minutes...",
+                        parse_mode='Markdown'
+                    )
+                    await track_other_notification(chat_id, next_file, wait_msg.message_id)
                     
                     # Wait for QUEUE_INTERVAL seconds
                     wait_start = datetime.now(UTC_PLUS_1)
@@ -1036,35 +1072,36 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                         if state.cancel_requested:
                             break
                         await asyncio.sleep(1)
-            
-            if state.cancel_requested:
-                break
                 
-    except asyncio.CancelledError:
-        logger.info(f"Queue processing cancelled for chat {chat_id}")
-    except Exception as e:
-        logger.error(f"Queue processing error: {e}")
-        try:
+                if state.cancel_requested:
+                    break
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Queue processing cancelled for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Queue processing error: {e}")
+            # Reset state to allow new processing
+            state.processing = False
+            state.processing_task = None
+            state.current_parts = []
+            state.current_index = 0
+            
             error_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
-                text=f"⚠️ Processing error\n{str(e)[:200]}",
-                disable_notification=True,
+                text=f"⚠️ Processing error\n{str(e)[:200]}\n\nQueue processing has been reset. You can upload new files.",
                 parse_mode='Markdown'
             )
-            async with state.upload_lock:
-                if state.queue:
-                    current_file = state.queue[0].get('name', 'Unknown') if state.queue else 'Unknown'
-                    await track_other_notification(chat_id, current_file, error_msg.message_id)
-        except Exception as notify_error:
-            logger.error(f"Failed to send error notification: {notify_error}")
-    finally:
-        state.processing = False
-        state.processing_task = None
-        state.current_parts = []
-        state.current_index = 0
-        state.paused = False
-        state.paused_progress = None
+            if state.queue:
+                current_file = state.queue[0].get('name', 'Unknown') if state.queue else 'Unknown'
+                await track_other_notification(chat_id, current_file, error_msg.message_id)
+        finally:
+            state.processing = False
+            state.processing_task = None
+            state.current_parts = []
+            state.current_index = 0
+            state.paused = False
+            state.paused_progress = None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
@@ -1180,6 +1217,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_thread_id = update.effective_message.message_thread_id
     state = get_user_state(chat_id)
     
+    # Validate state
+    validate_queue_state(state)
+    
     status_lines = []
     status_lines.append("📊 **FileX Status**")
     status_lines.append("──────────────")
@@ -1251,6 +1291,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time_str = entry['timestamp'].strftime('%H:%M:%S')
         status_emoji = {
             'completed': '✅',
+            'failed': '❌',
             'skipped': '⏭️',
             'deleted': '🗑️',
             'cancelled': '🚫',
@@ -1721,42 +1762,39 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_thread_id = update.effective_message.message_thread_id
     state = get_user_state(chat_id)
     
-    # NEW: Use upload lock to handle simultaneous uploads safely
-    async with state.upload_lock:
-        state.waiting_for_filename = False
-        state.last_deleted_file = None
-        
-        state.cancel_requested = False
-        
-        if not update.message.document:
-            return
-        
-        doc = update.message.document
-        file_name = doc.file_name
-        
-        if not file_name:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text="❌ **Invalid file**\nPlease upload a valid TXT or CSV file.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        if not is_supported_file(file_name):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text=f"❌ **Unsupported file type**\n"
-                f"Please upload only TXT or CSV files.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # NEW: Use thread-safe queue status check
-        queue_len, max_size = await state.safe_get_queue_status()
-        
-        if queue_len >= max_size:
+    state.waiting_for_filename = False
+    state.last_deleted_file = None
+    
+    state.cancel_requested = False
+    
+    if not update.message.document:
+        return
+    
+    doc = update.message.document
+    file_name = doc.file_name
+    
+    if not file_name:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text="❌ **Invalid file**\nPlease upload a valid TXT or CSV file.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    if not is_supported_file(file_name):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"❌ **Unsupported file type**\n"
+            f"Please upload only TXT or CSV files.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Validate queue size with lock to prevent race conditions
+    async with state.queue_lock:
+        if len(state.queue) >= MAX_QUEUE_SIZE:
             await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
@@ -1767,161 +1805,153 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
+        # Calculate queue position BEFORE appending
+        queue_position = len(state.queue) + 1  # Position after adding
+        is_first_task = not state.processing and len(state.queue) == 0
+    
+    try:
+        # Added timeout for file download to prevent "Timed out" error
+        file = await context.bot.get_file(doc.file_id)
+        
+        # Download with timeout
         try:
-            # Added timeout for file download to prevent "Timed out" error
-            file = await context.bot.get_file(doc.file_id)
-            
-            # Download with timeout
-            try:
-                file_bytes = await asyncio.wait_for(
-                    file.download_as_bytearray(),
-                    timeout=30.0  # 30 second timeout for file download
-                )
-            except asyncio.TimeoutError:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=message_thread_id,
-                    text=f"❌ **Download timeout**\n"
-                         f"File `{file_name}` is too large or download failed.\n"
-                         f"Please try again with a smaller file.",
-                    parse_mode='Markdown'
-                )
-                return
-            except Exception as e:
-                logger.error(f"File download error: {e}")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=message_thread_id,
-                    text=f"❌ **Download failed**\n"
-                         f"Could not download file `{file_name}`.\n"
-                         f"Please try again.",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            ext = Path(file_name).suffix.lower()
-            
-            if ext == '.csv':
-                content = process_csv_file(file_bytes, state.operation)
-            else:
-                text = file_bytes.decode('utf-8', errors='ignore')
-                content = process_content(text, state.operation)
-            
-            content_size = len(content)
-            
-            if content_size <= CONTENT_LIMIT_FOR_INTERVALS:
-                chunks = split_into_telegram_chunks_without_cutting_words(content, TELEGRAM_MESSAGE_LIMIT)
-                file_info = {
-                    'name': file_name,
-                    'content': content,
-                    'chunks': chunks,
-                    'size': content_size,
-                    'operation': state.operation,
-                    'requires_intervals': False,
-                    'message_thread_id': message_thread_id
-                }
-            else:
-                parts = split_large_content(content, CONTENT_LIMIT_FOR_INTERVALS)
-                file_info = {
-                    'name': file_name,
-                    'content': content,
-                    'parts': parts,
-                    'size': content_size,
-                    'operation': state.operation,
-                    'requires_intervals': True,
-                    'message_thread_id': message_thread_id
-                }
-            
-            # NEW: Use thread-safe queue append
-            success, error_message = await state.safe_queue_append(file_info)
-            
-            if not success:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=message_thread_id,
-                    text=f"❌ **{error_message}**\n"
-                         f"File `{file_name}` could not be added to queue.",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            is_first_task = not state.processing and len(state.queue) == 1  # Changed to == 1 since we just added
-            
-            if is_first_task:
-                if 'chunks' in file_info:
-                    parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
-                    notification = (
-                        f"✅ File accepted: `{file_name}`\n"
-                        f"Size: {content_size:,} characters{parts_info}\n"
-                        f"Operation: {state.operation.capitalize()}\n\n"
-                        f"🟢 Starting Your Task"
-                    )
-                else:
-                    parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
-                    notification = (
-                        f"✅ File accepted: `{file_name}`\n"
-                        f"Size: {content_size:,} characters{parts_info}\n"
-                        f"Operation: {state.operation.capitalize()}\n\n"
-                        f"🟢 Starting Your Task"
-                    )
-                
-                sent_msg = await context.bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=message_thread_id,
-                    text=notification,
-                    disable_notification=True,
-                    parse_mode='Markdown'
-                )
-                file_notification_mapping[file_name] = sent_msg.message_id
-                
-                if not state.processing:
-                    state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
-                    
-            else:
-                if 'chunks' in file_info:
-                    parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
-                else:
-                    parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
-                
-                # NEW: Get accurate queue position
-                queue_len, _ = await state.safe_get_queue_status()
-                queue_position = queue_len - 1 if state.processing else queue_len
-                
-                notification = (
-                    f"✅ File queued: `{file_name}`\n"
-                    f"Size: {content_size:,} characters{parts_info}\n"
-                    f"Operation: {state.operation.capitalize()}\n"
-                    f"Position in queue: {queue_position}\n"
-                    f"Queue interval: {QUEUE_INTERVAL // 60} minutes between files\n\n"
-                )
-                
-                sent_msg = await context.bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=message_thread_id,
-                    text=notification,
-                    disable_notification=True,
-                    parse_mode='Markdown'
-                )
-                file_notification_mapping[file_name] = sent_msg.message_id
-                
+            file_bytes = await asyncio.wait_for(
+                file.download_as_bytearray(),
+                timeout=30.0  # 30 second timeout for file download
+            )
         except asyncio.TimeoutError:
-            logger.error(f"File processing timeout for {file_name}")
             await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
-                text=f"❌ **Processing timeout**\n"
-                     f"File `{file_name}` is too large to process.\n"
-                     f"Please try with a smaller file.",
+                text=f"❌ **Download timeout**\n"
+                     f"File `{file_name}` is too large or download failed.\n"
+                     f"Please try again with a smaller file.",
                 parse_mode='Markdown'
             )
+            return
         except Exception as e:
-            logger.error(f"File processing error: {e}")
+            logger.error(f"File download error: {e}")
             await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
-                text=f"❌ Error processing file\n{str(e)[:200]}",
+                text=f"❌ **Download failed**\n"
+                     f"Could not download file `{file_name}`.\n"
+                     f"Please try again.",
                 parse_mode='Markdown'
             )
+            return
+        
+        ext = Path(file_name).suffix.lower()
+        
+        if ext == '.csv':
+            content = process_csv_file(file_bytes, state.operation)
+        else:
+            text = file_bytes.decode('utf-8', errors='ignore')
+            content = process_content(text, state.operation)
+        
+        content_size = len(content)
+        
+        # Validate content
+        if content_size == 0:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"❌ **Empty file**\nFile `{file_name}` contains no processable content.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Validate content size limit
+        MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+        if content_size > MAX_FILE_SIZE:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"❌ **File too large**\nFile `{file_name}` exceeds size limit of 50MB.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        if content_size <= CONTENT_LIMIT_FOR_INTERVALS:
+            chunks = split_into_telegram_chunks_without_cutting_words(content, TELEGRAM_MESSAGE_LIMIT)
+            file_info = {
+                'name': file_name,
+                'content': content,
+                'chunks': chunks,
+                'size': content_size,
+                'operation': state.operation,
+                'requires_intervals': False,
+                'message_thread_id': message_thread_id
+            }
+        else:
+            parts = split_large_content(content, CONTENT_LIMIT_FOR_INTERVALS)
+            file_info = {
+                'name': file_name,
+                'content': content,
+                'parts': parts,
+                'size': content_size,
+                'operation': state.operation,
+                'requires_intervals': True,
+                'message_thread_id': message_thread_id
+            }
+        
+        # Add file to queue with lock
+        async with state.queue_lock:
+            state.queue.append(file_info)
+        
+        # Send notification based on queue position
+        if 'chunks' in file_info:
+            parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
+        else:
+            parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
+        
+        if is_first_task:
+            notification = (
+                f"✅ File accepted: `{file_name}`\n"
+                f"Size: {content_size:,} characters{parts_info}\n"
+                f"Operation: {state.operation.capitalize()}\n\n"
+                f"🟢 Starting Your Task"
+            )
+        else:
+            notification = (
+                f"✅ File queued: `{file_name}`\n"
+                f"Size: {content_size:,} characters{parts_info}\n"
+                f"Operation: {state.operation.capitalize()}\n"
+                f"Position in queue: {queue_position}/{MAX_QUEUE_SIZE}\n"
+                f"Queue interval: {QUEUE_INTERVAL // 60} minutes between files\n\n"
+            )
+        
+        sent_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=notification,
+            disable_notification=True,
+            parse_mode='Markdown'
+        )
+        file_notification_mapping[file_name] = sent_msg.message_id
+        
+        # Start processing if this is the first task
+        if is_first_task and not state.processing:
+            state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
+                
+    except asyncio.TimeoutError:
+        logger.error(f"File processing timeout for {file_name}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"❌ **Processing timeout**\n"
+                 f"File `{file_name}` is too large to process.\n"
+                 f"Please try with a smaller file.",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"File processing error: {e}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"❌ Error processing file\n{str(e)[:200]}",
+            parse_mode='Markdown'
+        )
 
 async def health_handler(request):
     return web.Response(
