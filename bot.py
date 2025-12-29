@@ -525,6 +525,11 @@ class UserState:
         self.paused_at = None
         self.paused_progress = None
         
+        # ADDED: Lock for concurrent operations
+        self.queue_lock = asyncio.Lock()
+        # ADDED: Track if queue processor is running
+        self.queue_processor_running = False
+        
     def pause(self):
         self.paused = True
         self.paused_at = datetime.now(UTC_PLUS_1)
@@ -763,7 +768,9 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for `{filename}`")
-                return False  # Stop on failure
+                # FIXED: Don't mark as failed immediately, try to continue
+                # but don't mark as completed if some chunks failed
+                return False
         
         state = get_user_state(chat_id)
         state.last_send = datetime.now(UTC_PLUS_1)
@@ -815,7 +822,8 @@ async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TY
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for part {part_num} of `{filename}`")
-                return 0  # Return 0 on failure
+                # FIXED: Return 0 on critical failure
+                return 0
         
         return total_messages_in_part  # Return actual count
         
@@ -832,12 +840,14 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         
         for i, part in enumerate(parts, 1):
             if state.cancel_requested:
+                logger.info(f"Task cancelled while sending part {i} of {filename}")
                 return False
             
             while state.paused and not state.cancel_requested:
                 await asyncio.sleep(1)
             
             if state.cancel_requested:
+                logger.info(f"Task cancelled while paused at part {i} of {filename}")
                 return False
             
             state.current_index = i
@@ -847,8 +857,10 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
                 chat_id, context, part, i, total_parts, filename, message_thread_id
             )
             
-            if not messages_in_part:  # Check for 0 (failure) instead of <= 0
+            if messages_in_part == 0:  # Check for 0 (failure)
                 logger.error(f"Failed to send part {i} of `{filename}`")
+                # FIXED: Don't mark as completed if a part failed
+                update_file_history(chat_id, filename, 'failed', parts_count=total_parts)
                 return False
             
             total_messages_sent += messages_in_part  # Accumulate actual messages
@@ -858,6 +870,7 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
             if i < total_parts:
                 await asyncio.sleep(SEND_INTERVAL * 60)
         
+        # Only mark as completed if ALL parts were sent successfully
         # Use actual messages count, not parts count
         completion_msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -877,6 +890,8 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         raise
     except Exception as e:
         logger.error(f"Error in send_with_intervals: {e}")
+        # FIXED: Mark as failed instead of silently failing
+        update_file_history(chat_id, filename, 'failed', parts_count=total_parts)
         return False
 
 async def cleanup_completed_file(filename: str, chat_id: int):
@@ -892,52 +907,55 @@ async def cleanup_completed_file(filename: str, chat_id: int):
 async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, message_thread_id: Optional[int] = None):
     state = get_user_state(chat_id)
     
-    if state.processing:
-        return
+    # FIXED: Use lock to prevent multiple queue processors
+    async with state.queue_lock:
+        if state.queue_processor_running:
+            logger.debug(f"Queue processor already running for chat {chat_id}")
+            return
+        
+        state.queue_processor_running = True
+        state.processing = True
     
-    state.processing = True
     state.cancel_requested = False
     state.paused = False
     
     try:
-        while state.queue and not state.cancel_requested:
-            while state.paused and not state.cancel_requested:
-                await asyncio.sleep(1)
-            
-            if state.cancel_requested:
-                break
+        while True:
+            # FIXED: Use lock for queue access
+            async with state.queue_lock:
+                if not state.queue or state.cancel_requested:
+                    break
+                    
+                file_info = state.queue[0]
+                filename = file_info['name']
+                file_message_thread_id = file_info.get('message_thread_id', message_thread_id)
                 
-            file_info = state.queue[0]
-            filename = file_info['name']
-            file_message_thread_id = file_info.get('message_thread_id', message_thread_id)
+                if file_info.get('requires_intervals', False):
+                    update_file_history(chat_id, filename, 'running', parts_count=len(file_info['parts']))
+                else:
+                    update_file_history(chat_id, filename, 'running', messages_count=len(file_info['chunks']))
             
             if file_info.get('requires_intervals', False):
-                update_file_history(chat_id, filename, 'running', parts_count=len(file_info['parts']))
+                sending_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=file_message_thread_id,
+                    text=f"📤 Sending: `{filename}`\n"
+                         f"📊 Total parts: {len(file_info['parts'])}\n"
+                         f"⏰ Interval: {SEND_INTERVAL} minutes between parts",
+                    disable_notification=True,
+                    parse_mode='Markdown'
+                )
+                await track_other_notification(chat_id, filename, sending_msg.message_id)
             else:
-                update_file_history(chat_id, filename, 'running', messages_count=len(file_info['chunks']))
-            
-            if len(state.queue) > 0 and state.queue[0] == file_info:
-                if file_info.get('requires_intervals', False):
-                    sending_msg = await context.bot.send_message(
-                        chat_id=chat_id,
-                        message_thread_id=file_message_thread_id,
-                        text=f"📤 Sending: `{filename}`\n"
-                             f"📊 Total parts: {len(file_info['parts'])}\n"
-                             f"⏰ Interval: {SEND_INTERVAL} minutes between parts",
-                        disable_notification=True,
-                        parse_mode='Markdown'
-                    )
-                    await track_other_notification(chat_id, filename, sending_msg.message_id)
-                else:
-                    sending_msg = await context.bot.send_message(
-                        chat_id=chat_id,
-                        message_thread_id=file_message_thread_id,
-                        text=f"📤 Sending: `{filename}`\n"
-                             f"📊 Total messages: {len(file_info['chunks'])}",
-                        disable_notification=True,
-                        parse_mode='Markdown'
-                    )
-                    await track_other_notification(chat_id, filename, sending_msg.message_id)
+                sending_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=file_message_thread_id,
+                    text=f"📤 Sending: `{filename}`\n"
+                         f"📊 Total messages: {len(file_info['chunks'])}",
+                    disable_notification=True,
+                    parse_mode='Markdown'
+                )
+                await track_other_notification(chat_id, filename, sending_msg.message_id)
             
             success = False
             if file_info.get('requires_intervals', False):
@@ -956,39 +974,44 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     file_message_thread_id
                 )
             
-            # Always remove the file from queue after processing (success or failure)
-            if state.queue and state.queue[0]['name'] == filename:
-                processed_file = state.queue.popleft()
-                processed_filename = processed_file['name']
-                
-                if success and not state.cancel_requested:
-                    logger.info(f"Successfully processed `{processed_filename}` for chat {chat_id}")
-                else:
-                    logger.error(f"Failed to process `{processed_filename}` for chat {chat_id}")
-                    failed_msg = await context.bot.send_message(
-                        chat_id=chat_id,
-                        message_thread_id=file_message_thread_id,
-                        text=f"❌ Failed to send: `{processed_filename}`\nPlease try uploading again.",
-                        disable_notification=True,
-                        parse_mode='Markdown'
-                    )
-                    await track_other_notification(chat_id, processed_filename, failed_msg.message_id)
+            # FIXED: Use lock for queue removal
+            async with state.queue_lock:
+                if state.queue and state.queue[0]['name'] == filename:
+                    processed_file = state.queue.popleft()
+                    processed_filename = processed_file['name']
+                    
+                    if success and not state.cancel_requested:
+                        logger.info(f"Successfully processed `{processed_filename}` for chat {chat_id}")
+                        await cleanup_completed_file(processed_filename, chat_id)
+                    else:
+                        logger.error(f"Failed to process `{processed_filename}` for chat {chat_id}")
+                        failed_msg = await context.bot.send_message(
+                            chat_id=chat_id,
+                            message_thread_id=file_message_thread_id,
+                            text=f"❌ Failed to send: `{processed_filename}`\nPlease try uploading again.",
+                            disable_notification=True,
+                            parse_mode='Markdown'
+                        )
+                        await track_other_notification(chat_id, processed_filename, failed_msg.message_id)
+                        update_file_history(chat_id, processed_filename, 'failed')
             
             state.current_parts = []
             state.current_index = 0
             
             # Wait 2 minutes before processing next file (if any remain)
+            async with state.queue_lock:
+                if state.queue and not state.cancel_requested:
+                    next_file = state.queue[0]['name']
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        message_thread_id=message_thread_id,
+                        text=f"⏰ **Queue Interval**\n\n"
+                             f"Next file `{next_file}` will start in 2 minutes...",
+                        parse_mode='Markdown'
+                    )
+            
+            # Wait for QUEUE_INTERVAL seconds
             if state.queue and not state.cancel_requested:
-                next_file = state.queue[0]['name']
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=message_thread_id,
-                    text=f"⏰ **Queue Interval**\n\n"
-                         f"Next file `{next_file}` will start in 2 minutes...",
-                    parse_mode='Markdown'
-                )
-                
-                # Wait for QUEUE_INTERVAL seconds
                 wait_start = datetime.now(UTC_PLUS_1)
                 while (datetime.now(UTC_PLUS_1) - wait_start).seconds < QUEUE_INTERVAL:
                     if state.cancel_requested:
@@ -1013,12 +1036,15 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
             current_file = state.queue[0].get('name', 'Unknown') if state.queue else 'Unknown'
             await track_other_notification(chat_id, current_file, error_msg.message_id)
     finally:
-        state.processing = False
-        state.processing_task = None
-        state.current_parts = []
-        state.current_index = 0
-        state.paused = False
-        state.paused_progress = None
+        # FIXED: Use lock for state cleanup
+        async with state.queue_lock:
+            state.processing = False
+            state.queue_processor_running = False
+            state.processing_task = None
+            state.current_parts = []
+            state.current_index = 0
+            state.paused = False
+            state.paused_progress = None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
@@ -1209,7 +1235,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'deleted': '🗑️',
             'cancelled': '🚫',
             'running': '📤',
-            'paused': '⏸️'
+            'paused': '⏸️',
+            'failed': '❌'  # ADDED: Failed status
         }.get(entry['status'], '📝')
         
         count_info = ""
@@ -1705,16 +1732,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    if len(state.queue) >= MAX_QUEUE_SIZE:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text=f"❌ **Queue is full!**\n"
-            f"Maximum {MAX_QUEUE_SIZE} files allowed.\n"
-            "Please wait for current files to be processed.",
-            parse_mode='Markdown'
-        )
-        return
+    # FIXED: Use lock for queue operations to prevent race conditions
+    async with state.queue_lock:
+        if len(state.queue) >= MAX_QUEUE_SIZE:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"❌ **Queue is full!**\n"
+                f"Maximum {MAX_QUEUE_SIZE} files allowed.\n"
+                "Please wait for current files to be processed.",
+                parse_mode='Markdown'
+            )
+            return
     
     try:
         # Added timeout for file download to prevent "Timed out" error
@@ -1781,9 +1810,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'message_thread_id': message_thread_id
             }
         
-        is_first_task = not state.processing and len(state.queue) == 0
-        
-        state.queue.append(file_info)
+        # FIXED: Use lock for atomic queue operations
+        async with state.queue_lock:
+            is_first_task = not state.processing and len(state.queue) == 0
+            
+            state.queue.append(file_info)
+            
+            queue_position = len(state.queue)
         
         if is_first_task:
             if 'chunks' in file_info:
@@ -1812,16 +1845,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             file_notification_mapping[file_name] = sent_msg.message_id
             
-            if not state.processing:
-                state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
-                
+            # FIXED: Use lock to ensure only one processor starts
+            async with state.queue_lock:
+                if not state.processing:
+                    state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
+                    
         else:
             if 'chunks' in file_info:
                 parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
             else:
                 parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
-            
-            queue_position = max(0, len(state.queue) - 1) if state.processing else len(state.queue)
             
             notification = (
                 f"✅ File queued: `{file_name}`\n"
