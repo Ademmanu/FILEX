@@ -68,31 +68,6 @@ file_message_mapping = {}
 file_notification_mapping = {}
 file_other_notifications = {}
 
-# ==================== THREAD SAFETY LOCKS ====================
-user_state_locks: Dict[int, asyncio.Lock] = {}
-queue_locks: Dict[int, asyncio.Lock] = {}
-
-async def get_user_state_safe(chat_id: int) -> UserState:
-    """Thread-safe access to user state"""
-    async with user_state_locks.setdefault(chat_id, asyncio.Lock()):
-        return get_user_state(chat_id)
-
-async def add_to_queue_safe(state: UserState, file_info: dict) -> int:
-    """Thread-safe queue addition with proper position calculation"""
-    async with queue_locks.setdefault(state.chat_id, asyncio.Lock()):
-        state.queue.append(file_info)
-        return len(state.queue)
-
-def get_queue_position_safe(state: UserState) -> int:
-    """Get accurate queue position accounting for current processing"""
-    if not state.queue:
-        return 0
-    
-    position = len(state.queue)
-    if state.processing:
-        position -= 1  # Currently processing file is not in waiting queue
-    return max(0, position)
-
 # ==================== ADMIN PREVIEW SYSTEM ====================
 class MessageEntry:
     """Stores first two words of sent messages"""
@@ -479,19 +454,6 @@ async def periodic_cleanup_task():
             logger.error(f"Error in periodic cleanup task: {e}")
             await asyncio.sleep(300)
 
-def cleanup_stuck_tasks():
-    """Clean up tasks that have been processing for too long"""
-    current_time = datetime.now(UTC_PLUS_1)
-    for chat_id, state in list(user_states.items()):
-        try:
-            if state.processing and hasattr(state, 'processing_start_time'):
-                if (current_time - state.processing_start_time).total_seconds() > MAX_PROCESSING_TIME:
-                    logger.warning(f"Cleaning up stuck task for chat {chat_id} after {MAX_PROCESSING_TIME} seconds")
-                    state.cancel_current_task()
-                    update_file_history(chat_id, "Unknown", "timeout_cancelled")
-        except Exception as e:
-            logger.error(f"Error cleaning up stuck task for chat {chat_id}: {e}")
-
 def update_file_history(chat_id: int, filename: str, status: str, parts_count: int = 0, messages_count: int = 0):
     file_history[chat_id] = [entry for entry in file_history.get(chat_id, []) 
                            if entry['filename'] != filename]
@@ -608,10 +570,48 @@ class UserState:
 
 user_states: Dict[int, UserState] = {}
 
+# ==================== THREAD SAFETY LOCKS ====================
+user_state_locks: Dict[int, asyncio.Lock] = {}
+queue_locks: Dict[int, asyncio.Lock] = {}
+
 def get_user_state(chat_id: int) -> UserState:
     if chat_id not in user_states:
         user_states[chat_id] = UserState(chat_id)
     return user_states[chat_id]
+
+async def get_user_state_safe(chat_id: int) -> UserState:
+    """Thread-safe access to user state"""
+    async with user_state_locks.setdefault(chat_id, asyncio.Lock()):
+        return get_user_state(chat_id)
+
+async def add_to_queue_safe(state: UserState, file_info: dict) -> int:
+    """Thread-safe queue addition with proper position calculation"""
+    async with queue_locks.setdefault(state.chat_id, asyncio.Lock()):
+        state.queue.append(file_info)
+        return len(state.queue)
+
+def get_queue_position_safe(state: UserState) -> int:
+    """Get accurate queue position accounting for current processing"""
+    if not state.queue:
+        return 0
+    
+    position = len(state.queue)
+    if state.processing:
+        position -= 1  # Currently processing file is not in waiting queue
+    return max(0, position)
+
+def cleanup_stuck_tasks():
+    """Clean up tasks that have been processing for too long"""
+    current_time = datetime.now(UTC_PLUS_1)
+    for chat_id, state in list(user_states.items()):
+        try:
+            if state.processing and state.processing_start_time:
+                if (current_time - state.processing_start_time).total_seconds() > MAX_PROCESSING_TIME:
+                    logger.warning(f"Cleaning up stuck task for chat {chat_id} after {MAX_PROCESSING_TIME} seconds")
+                    state.cancel_current_task()
+                    update_file_history(chat_id, "Unknown", "timeout_cancelled")
+        except Exception as e:
+            logger.error(f"Error cleaning up stuck task for chat {chat_id}: {e}")
 
 def is_supported_file(filename: str) -> bool:
     if not filename:
