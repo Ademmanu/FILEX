@@ -36,6 +36,7 @@ CONTENT_LIMIT_FOR_INTERVALS = 60000
 SEND_INTERVAL = 3.5
 MESSAGE_DELAY = 0.5  # Added: Delay between messages in seconds
 QUEUE_INTERVAL = 2 * 60  # Added: 2-minute interval between files in seconds
+MAX_PROCESSING_TIME = 30 * 60  # 30 minutes timeout for file processing in seconds
 
 ALLOWED_USERS_STR = os.getenv('ALLOWED_USERS', '6389552329')
 ALLOWED_IDS = set()
@@ -66,6 +67,31 @@ file_history = defaultdict(list)
 file_message_mapping = {}
 file_notification_mapping = {}
 file_other_notifications = {}
+
+# ==================== THREAD SAFETY LOCKS ====================
+user_state_locks: Dict[int, asyncio.Lock] = {}
+queue_locks: Dict[int, asyncio.Lock] = {}
+
+async def get_user_state_safe(chat_id: int) -> UserState:
+    """Thread-safe access to user state"""
+    async with user_state_locks.setdefault(chat_id, asyncio.Lock()):
+        return get_user_state(chat_id)
+
+async def add_to_queue_safe(state: UserState, file_info: dict) -> int:
+    """Thread-safe queue addition with proper position calculation"""
+    async with queue_locks.setdefault(state.chat_id, asyncio.Lock()):
+        state.queue.append(file_info)
+        return len(state.queue)
+
+def get_queue_position_safe(state: UserState) -> int:
+    """Get accurate queue position accounting for current processing"""
+    if not state.queue:
+        return 0
+    
+    position = len(state.queue)
+    if state.processing:
+        position -= 1  # Currently processing file is not in waiting queue
+    return max(0, position)
 
 # ==================== ADMIN PREVIEW SYSTEM ====================
 class MessageEntry:
@@ -443,14 +469,28 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
 
 # ==================== PERIODIC CLEANUP TASK ====================
 async def periodic_cleanup_task():
-    """Periodically clean up old messages"""
+    """Periodically clean up old messages and stuck tasks"""
     while True:
         try:
             cleanup_old_messages()
+            cleanup_stuck_tasks()
             await asyncio.sleep(3600)  # Run every hour
         except Exception as e:
             logger.error(f"Error in periodic cleanup task: {e}")
             await asyncio.sleep(300)
+
+def cleanup_stuck_tasks():
+    """Clean up tasks that have been processing for too long"""
+    current_time = datetime.now(UTC_PLUS_1)
+    for chat_id, state in list(user_states.items()):
+        try:
+            if state.processing and hasattr(state, 'processing_start_time'):
+                if (current_time - state.processing_start_time).total_seconds() > MAX_PROCESSING_TIME:
+                    logger.warning(f"Cleaning up stuck task for chat {chat_id} after {MAX_PROCESSING_TIME} seconds")
+                    state.cancel_current_task()
+                    update_file_history(chat_id, "Unknown", "timeout_cancelled")
+        except Exception as e:
+            logger.error(f"Error cleaning up stuck task for chat {chat_id}: {e}")
 
 def update_file_history(chat_id: int, filename: str, status: str, parts_count: int = 0, messages_count: int = 0):
     file_history[chat_id] = [entry for entry in file_history.get(chat_id, []) 
@@ -520,6 +560,7 @@ class UserState:
         self.cancel_requested = False
         self.waiting_for_filename = False
         self.last_deleted_file = None
+        self.processing_start_time = None
         
         self.paused = False
         self.paused_at = None
@@ -546,11 +587,13 @@ class UserState:
         self.processing = False
         self.current_parts = []
         self.current_index = 0
+        self.processing_start_time = None
         
     def clear_queue(self):
         count = len(self.queue)
         self.queue.clear()
         self.cancel_requested = False
+        self.processing_start_time = None
         return count
         
     def has_active_tasks(self) -> bool:
@@ -765,7 +808,7 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
                 logger.error(f"Failed to send chunk {i} for `{filename}`")
                 return False  # Stop on failure
         
-        state = get_user_state(chat_id)
+        state = await get_user_state_safe(chat_id)
         state.last_send = datetime.now(UTC_PLUS_1)
         
         if total_messages_sent > 0:
@@ -890,7 +933,7 @@ async def cleanup_completed_file(filename: str, chat_id: int):
     logger.info(f"Cleaned up tracking for completed file: {filename} in chat {chat_id}")
 
 async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, message_thread_id: Optional[int] = None):
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     if state.processing:
         return
@@ -898,9 +941,16 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
     state.processing = True
     state.cancel_requested = False
     state.paused = False
+    state.processing_start_time = datetime.now(UTC_PLUS_1)
     
     try:
         while state.queue and not state.cancel_requested:
+            # Check for processing timeout
+            if (datetime.now(UTC_PLUS_1) - state.processing_start_time).total_seconds() > MAX_PROCESSING_TIME:
+                logger.warning(f"Processing timeout for chat {chat_id}")
+                state.cancel_current_task()
+                break
+            
             while state.paused and not state.cancel_requested:
                 await asyncio.sleep(1)
             
@@ -963,6 +1013,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                 
                 if success and not state.cancel_requested:
                     logger.info(f"Successfully processed `{processed_filename}` for chat {chat_id}")
+                    await cleanup_completed_file(processed_filename, chat_id)
                 else:
                     logger.error(f"Failed to process `{processed_filename}` for chat {chat_id}")
                     failed_msg = await context.bot.send_message(
@@ -980,7 +1031,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
             # Wait 2 minutes before processing next file (if any remain)
             if state.queue and not state.cancel_requested:
                 next_file = state.queue[0]['name']
-                await context.bot.send_message(
+                next_file_msg = await context.bot.send_message(
                     chat_id=chat_id,
                     message_thread_id=message_thread_id,
                     text=f"⏰ **Queue Interval**\n\n"
@@ -992,8 +1043,12 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                 wait_start = datetime.now(UTC_PLUS_1)
                 while (datetime.now(UTC_PLUS_1) - wait_start).seconds < QUEUE_INTERVAL:
                     if state.cancel_requested:
+                        await context.bot.delete_message(chat_id=chat_id, message_id=next_file_msg.message_id)
                         break
                     await asyncio.sleep(1)
+                
+                if not state.cancel_requested:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=next_file_msg.message_id)
             
             if state.cancel_requested:
                 break
@@ -1019,6 +1074,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
         state.current_index = 0
         state.paused = False
         state.paused_progress = None
+        state.processing_start_time = None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
@@ -1026,14 +1082,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     await context.bot.send_message(
         chat_id=chat_id,
         message_thread_id=message_thread_id,
         text="🤖 **FileX Bot**\n\n"
         f"📝 **Current operation:** {state.operation.capitalize()} content\n"
-        f"📊 **Queue:** {max(0, len(state.queue) - 1) if state.processing else len(state.queue)}/{MAX_QUEUE_SIZE} files\n"
+        f"📊 **Queue:** {get_queue_position_safe(state)}/{MAX_QUEUE_SIZE} files\n"
         f"⏰ **Queue interval:** {QUEUE_INTERVAL // 60} minutes between files\n\n"
         "📁 **Supported files:** TXT, CSV\n\n"
         "🛠 **Operations available:**\n"
@@ -1060,7 +1116,7 @@ async def operation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     operation_descriptions = {
         'all': 'Send all file content as-is',
@@ -1106,7 +1162,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     message_thread_id = query.message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     operation = query.data
     
     operation_names = {
@@ -1132,13 +1188,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     status_lines = []
     status_lines.append("📊 **FileX Status**")
     status_lines.append("──────────────")
     status_lines.append(f"🔧 **Operation:** {state.operation.capitalize()} content")
-    status_lines.append(f"📋 **Queue:** {max(0, len(state.queue) - 1) if state.processing else len(state.queue)}/{MAX_QUEUE_SIZE} files")
+    status_lines.append(f"📋 **Queue:** {get_queue_position_safe(state)}/{MAX_QUEUE_SIZE} files")
     
     if state.processing:
         if state.current_parts:
@@ -1209,7 +1265,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'deleted': '🗑️',
             'cancelled': '🚫',
             'running': '📤',
-            'paused': '⏸️'
+            'paused': '⏸️',
+            'timeout_cancelled': '⏱️'
         }.get(entry['status'], '📝')
         
         count_info = ""
@@ -1241,7 +1298,7 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     if not state.queue:
         await context.bot.send_message(
@@ -1288,7 +1345,7 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     if not state.processing:
         await context.bot.send_message(
@@ -1340,7 +1397,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     if not state.paused:
         await context.bot.send_message(
@@ -1391,7 +1448,7 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     if not state.processing and not state.queue:
         await context.bot.send_message(
@@ -1446,7 +1503,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     if not state.has_active_tasks():
         await context.bot.send_message(
@@ -1493,7 +1550,7 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     if state.waiting_for_filename:
         filename = update.message.text.strip()
@@ -1653,7 +1710,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     chat_id = update.effective_chat.id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     # Check if waiting for filename (deletion flow) - MUST CHECK THIS FIRST
     if state.waiting_for_filename:
@@ -1673,7 +1730,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
-    state = get_user_state(chat_id)
+    state = await get_user_state_safe(chat_id)
     
     state.waiting_for_filename = False
     state.last_deleted_file = None
@@ -1705,7 +1762,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    if len(state.queue) >= MAX_QUEUE_SIZE:
+    # Check queue size thread-safely
+    queue_position = get_queue_position_safe(state)
+    if queue_position >= MAX_QUEUE_SIZE:
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
@@ -1781,11 +1840,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'message_thread_id': message_thread_id
             }
         
-        is_first_task = not state.processing and len(state.queue) == 0
+        # Thread-safe queue addition
+        queue_size = await add_to_queue_safe(state, file_info)
+        queue_position = get_queue_position_safe(state)
         
-        state.queue.append(file_info)
+        # Check if this should start processing
+        should_start_processing = not state.processing and queue_size == 1
         
-        if is_first_task:
+        if should_start_processing:
             if 'chunks' in file_info:
                 parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
                 notification = (
@@ -1820,8 +1882,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
             else:
                 parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
-            
-            queue_position = max(0, len(state.queue) - 1) if state.processing else len(state.queue)
             
             notification = (
                 f"✅ File queued: `{file_name}`\n"
