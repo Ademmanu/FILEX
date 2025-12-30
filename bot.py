@@ -907,9 +907,6 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
             if state.cancel_requested:
                 break
                 
-            if not state.queue:  # Double-check queue is not empty
-                break
-                
             file_info = state.queue[0]
             filename = file_info['name']
             file_message_thread_id = file_info.get('message_thread_id', message_thread_id)
@@ -943,45 +940,31 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     await track_other_notification(chat_id, filename, sending_msg.message_id)
             
             success = False
-            try:
-                # === FIX 1: Process each file in isolated try-except ===
-                if file_info.get('requires_intervals', False):
-                    success = await send_with_intervals(
-                        chat_id, context, 
-                        file_info['parts'], 
-                        filename,
-                        state,
-                        file_message_thread_id
-                    )
-                else:
-                    success = await send_chunks_immediately(
-                        chat_id, context,
-                        file_info['chunks'],
-                        filename,
-                        file_message_thread_id
-                    )
-            except Exception as e:
-                logger.error(f"Error processing file `{filename}`: {e}")
-                success = False
+            if file_info.get('requires_intervals', False):
+                success = await send_with_intervals(
+                    chat_id, context, 
+                    file_info['parts'], 
+                    filename,
+                    state,
+                    file_message_thread_id
+                )
+            else:
+                success = await send_chunks_immediately(
+                    chat_id, context,
+                    file_info['chunks'],
+                    filename,
+                    file_message_thread_id
+                )
             
-            # === FIX 2: ALWAYS remove file from queue after processing attempt ===
-            if state.queue and len(state.queue) > 0 and state.queue[0]['name'] == filename:
+            # Always remove the file from queue after processing (success or failure)
+            if state.queue and state.queue[0]['name'] == filename:
                 processed_file = state.queue.popleft()
                 processed_filename = processed_file['name']
                 
-                # Reset state variables
-                state.current_parts = []
-                state.current_index = 0
-                state.paused_progress = None
-                
                 if success and not state.cancel_requested:
                     logger.info(f"Successfully processed `{processed_filename}` for chat {chat_id}")
-                    await cleanup_completed_file(processed_filename, chat_id)
                 else:
                     logger.error(f"Failed to process `{processed_filename}` for chat {chat_id}")
-                    update_file_history(chat_id, processed_filename, 'failed')
-                    
-                    # Send failure notification
                     failed_msg = await context.bot.send_message(
                         chat_id=chat_id,
                         message_thread_id=file_message_thread_id,
@@ -993,7 +976,6 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
             
             state.current_parts = []
             state.current_index = 0
-            state.paused_progress = None
             
             # Wait 2 minutes before processing next file (if any remain)
             if state.queue and not state.cancel_requested:
@@ -1031,7 +1013,6 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
             current_file = state.queue[0].get('name', 'Unknown') if state.queue else 'Unknown'
             await track_other_notification(chat_id, current_file, error_msg.message_id)
     finally:
-        # === FIX 3: ALWAYS reset state variables ===
         state.processing = False
         state.processing_task = None
         state.current_parts = []
@@ -1228,8 +1209,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'deleted': '🗑️',
             'cancelled': '🚫',
             'running': '📤',
-            'paused': '⏸️',
-            'failed': '❌'  # Added for failed files
+            'paused': '⏸️'
         }.get(entry['status'], '📝')
         
         count_info = ""
