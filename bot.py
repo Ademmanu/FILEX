@@ -9,7 +9,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Deque, Set, Tuple, Any
+from typing import Dict, List, Optional, Deque, Set, Tuple
 from collections import deque, defaultdict
 from pathlib import Path
 import csv
@@ -70,12 +70,11 @@ file_other_notifications = {}
 
 # ==================== ADMIN PREVIEW SYSTEM ====================
 class MessageEntry:
-    """Stores all words of sent messages"""
-    def __init__(self, chat_id: int, message_id: int, all_words: List[str], timestamp: datetime):
+    """Stores first two words of sent messages"""
+    def __init__(self, chat_id: int, message_id: int, first_two_words: str, timestamp: datetime):
         self.chat_id = chat_id
         self.message_id = message_id
-        self.all_words = all_words
-        self.first_two_words = ' '.join(all_words[:2]) if len(all_words) >= 2 else ' '.join(all_words)
+        self.first_two_words = first_two_words
         self.timestamp = timestamp
     
     def is_expired(self) -> bool:
@@ -87,10 +86,8 @@ class MessageEntry:
 
 # Global storage for message tracking
 message_tracking: List[MessageEntry] = []
+MAX_TRACKED_MESSAGES = 1000
 admin_preview_mode: Set[int] = set()  # Just track which admins are in preview mode
-
-# ==================== DUPLICATE FILE CHECK SYSTEM ====================
-pending_file_confirmation: Dict[int, Dict[str, Any]] = {}  # chat_id -> file_info
 
 # ==================== ADMIN FUNCTIONS ====================
 def is_admin(user_id: int) -> bool:
@@ -111,8 +108,8 @@ async def check_admin_authorization(update: Update, context: ContextTypes.DEFAUL
     return False
 
 # ==================== MESSAGE TRACKING FUNCTIONS ====================
-def extract_all_words(text: str) -> List[str]:
-    """Extract all words from text, handling markdown and special chars"""
+def extract_first_two_words(text: str) -> str:
+    """Extract first two words from text, handling markdown and special chars"""
     # Remove markdown formatting but keep normal text
     clean_text = text
     # Remove URLs
@@ -120,18 +117,23 @@ def extract_all_words(text: str) -> List[str]:
     # Replace multiple spaces with single space
     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
     
-    # Split into words
+    # Split into words and take first two
     words = clean_text.split()
-    return words
+    if len(words) >= 2:
+        return f"{words[0]} {words[1]}"
+    elif len(words) == 1:
+        return words[0]
+    else:
+        return ""
 
 def track_message(chat_id: int, message_id: int, message_text: str):
-    """Track all words of sent message"""
+    """Track first two words of sent message"""
     try:
         if not message_text or len(message_text.strip()) < 2:
             return
         
-        all_words = extract_all_words(message_text)
-        if not all_words:
+        first_two_words = extract_first_two_words(message_text)
+        if not first_two_words:
             return
         
         # Remove expired entries first
@@ -141,13 +143,17 @@ def track_message(chat_id: int, message_id: int, message_text: str):
         entry = MessageEntry(
             chat_id=chat_id,
             message_id=message_id,
-            all_words=all_words,
+            first_two_words=first_two_words,
             timestamp=datetime.now(UTC_PLUS_1)
         )
         
         message_tracking.append(entry)
         
-        logger.debug(f"Tracked message: {all_words[:5]}...")
+        # Keep only last MAX_TRACKED_MESSAGES
+        if len(message_tracking) > MAX_TRACKED_MESSAGES:
+            del message_tracking[0]
+        
+        logger.debug(f"Tracked message: {first_two_words}")
         
     except Exception as e:
         logger.error(f"Error tracking message: {e}")
@@ -221,113 +227,32 @@ def extract_preview_sections(text: str) -> List[str]:
     
     return preview_sections
 
-def extract_preview_words(preview_text: str) -> List[str]:
-    """Extract individual words/numbers from preview text"""
-    # Split by whitespace and filter out empty strings
-    words = [word.strip() for word in preview_text.split() if word.strip()]
-    return words
-
-def find_partial_matches_in_database(preview_words: List[str]) -> List[Dict[str, Any]]:
-    """
-    Find partial matches for preview words in all tracked messages
-    Returns list of matches with details
-    """
-    if not message_tracking or not preview_words:
-        return []
-    
-    partial_matches = []
-    
-    for entry in message_tracking:
-        message_words = entry.all_words
-        
-        for preview_word in preview_words:
-            if preview_word in message_words:
-                # Find position in message (1-based index)
-                position = message_words.index(preview_word) + 1
-                
-                match_info = {
-                    'preview_word': preview_word,
-                    'first_two_words': entry.first_two_words,
-                    'chat_id': entry.chat_id,
-                    'message_id': entry.message_id,
-                    'word_position': position,
-                    'timestamp': entry.timestamp
-                }
-                partial_matches.append(match_info)
-    
-    return partial_matches
-
-def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str], List[str]]:
     """
     Check preview texts against tracked messages
-    Returns: (full_matches, non_matches, partial_matches)
+    Returns: (matches, non_matches)
     """
     if not message_tracking:
-        return ([], preview_texts, [])
+        return ([], preview_texts)
     
     # Get all unique first_two_words from database
-    tracked_first_two = {entry.first_two_words for entry in message_tracking}
+    tracked_words = {entry.first_two_words for entry in message_tracking}
     
-    full_matches = []
+    matches = []
     non_matches = []
-    all_partial_matches = []
     
     for preview in preview_texts:
         # Extract first two words from preview text
-        preview_words_list = extract_preview_words(preview)
-        preview_first_two = ' '.join(preview_words_list[:2]) if len(preview_words_list) >= 2 else ' '.join(preview_words_list)
+        preview_words = extract_first_two_words(preview)
         
-        if preview_first_two and preview_first_two in tracked_first_two:
-            full_matches.append(preview)
+        if preview_words and preview_words in tracked_words:
+            matches.append(preview)
         else:
             non_matches.append(preview)
-            
-            # Check for partial matches in all words
-            partial_matches = find_partial_matches_in_database(preview_words_list)
-            if partial_matches:
-                # Group by preview text
-                preview_partial_info = {
-                    'preview_text': preview,
-                    'matches': partial_matches
-                }
-                all_partial_matches.append(preview_partial_info)
     
-    return (full_matches, non_matches, all_partial_matches)
+    return (matches, non_matches)
 
-def format_partial_matches_report(partial_matches_list: List[Dict[str, Any]]) -> str:
-    """Format partial matches report with word positions"""
-    if not partial_matches_list:
-        return ""
-    
-    report_lines = []
-    report_lines.append("⚠️ **Partial matches found:**")
-    
-    for idx, preview_info in enumerate(partial_matches_list, 1):
-        preview_text = preview_info['preview_text']
-        matches = preview_info['matches']
-        
-        # Group matches by preview word
-        word_matches = {}
-        for match in matches:
-            word = match['preview_word']
-            if word not in word_matches:
-                word_matches[word] = []
-            word_matches[word].append(match['word_position'])
-        
-        report_lines.append(f"{idx}. Preview: {preview_text}")
-        
-        for word, positions in word_matches.items():
-            positions_str = ', '.join(map(str, positions))
-            report_lines.append(f"   Matched words: {word}")
-            report_lines.append(f"   Word position: {positions_str}")
-        
-        if idx < len(partial_matches_list):
-            report_lines.append("")
-    
-    return "\n".join(report_lines)
-
-def format_preview_report_exact(full_matches: List[str], non_matches: List[str], 
-                               partial_matches: List[Dict[str, Any]],
+def format_preview_report_exact(matches: List[str], non_matches: List[str], 
                                total_previews: int) -> str:
     """Format the preview report exactly like the example provided"""
     
@@ -340,29 +265,22 @@ def format_preview_report_exact(full_matches: List[str], non_matches: List[str],
     report_lines.append("")
     report_lines.append("📋 **Preview Analysis:**")
     
-    full_match_percent = (len(full_matches) / total_previews * 100) if total_previews > 0 else 0
-    partial_match_count = len(partial_matches) if partial_matches else 0
-    partial_match_percent = (partial_match_count / total_previews * 100) if total_previews > 0 else 0
+    match_percent = (len(matches) / total_previews * 100) if total_previews > 0 else 0
     non_match_percent = (len(non_matches) / total_previews * 100) if total_previews > 0 else 0
     
     report_lines.append(f"• Total previews checked: {total_previews}")
-    report_lines.append(f"• Full matches found: {len(full_matches)} ({full_match_percent:.1f}%)")
-    report_lines.append(f"• Partial matches: {partial_match_count} ({partial_match_percent:.1f}%)")
+    report_lines.append(f"• Matches found: {len(matches)} ({match_percent:.1f}%)")
     report_lines.append(f"• Non-matches: {len(non_matches)} ({non_match_percent:.1f}%)")
     report_lines.append("")
     
-    if full_matches:
-        report_lines.append("✅ **Full matches found in database:**")
-        for i, match in enumerate(full_matches, 1):
+    if matches:
+        report_lines.append("✅ **Matches found in database:**")
+        for i, match in enumerate(matches, 1):
             report_lines.append(f"{i}. {match}")
     
-    if partial_matches:
-        if full_matches:
+    if non_matches:
+        if matches:
             report_lines.append("")
-        partial_report = format_partial_matches_report(partial_matches)
-        report_lines.append(partial_report)
-    
-    if non_matches and not full_matches and not partial_matches:
         report_lines.append("⚠️ **Not found in database:**")
         for i, non_match in enumerate(non_matches, 1):
             report_lines.append(f"{i}. {non_match}")
@@ -371,140 +289,6 @@ def format_preview_report_exact(full_matches: List[str], non_matches: List[str],
     report_lines.append("Use /cancelpreview to cancel.")
                                    
     return "\n".join(report_lines)
-
-# ==================== DUPLICATE FILE CHECK FUNCTIONS ====================
-def check_file_duplicate_in_history(chat_id: int, filename: str, content: str) -> bool:
-    """Check if file content was posted in last 72 hours"""
-    cutoff_time = datetime.now(UTC_PLUS_1) - timedelta(hours=72)
-    
-    for entry in file_history.get(chat_id, []):
-        if entry['filename'] == filename and entry['timestamp'] >= cutoff_time:
-            # Check if the file was completed (not cancelled or failed)
-            if entry['status'] == 'completed':
-                return True
-    return False
-
-async def ask_file_post_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
-                                    file_info: Dict[str, Any], chat_id: int, 
-                                    message_thread_id: Optional[int] = None):
-    """Ask user for confirmation to post duplicate file"""
-    
-    pending_file_confirmation[chat_id] = file_info
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Yes, Post", callback_data=f"confirm_post_{chat_id}"),
-            InlineKeyboardButton("❌ No, Don't", callback_data=f"cancel_post_{chat_id}")
-        ]
-    ]
-    
-    await context.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=message_thread_id,
-        text=f"⚠️ **Duplicate File Detected**\n\n"
-             f"File `{file_info['name']}` was already posted in the last 72 hours.\n\n"
-             f"**Do you want to post it again?**\n\n"
-             f"Size: {file_info['size']:,} characters\n"
-             f"Operation: {file_info['operation'].capitalize()}",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-
-async def handle_post_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
-                                  callback_data: str, chat_id: int):
-    """Handle post confirmation response"""
-    query = update.callback_query
-    await query.answer()
-    
-    if callback_data.startswith('confirm_post_'):
-        # User confirmed posting
-        file_info = pending_file_confirmation.get(chat_id)
-        if not file_info:
-            await query.edit_message_text(
-                text="❌ **Error**\n\nFile information not found. Please upload the file again."
-            )
-            return
-        
-        # Remove from pending
-        if chat_id in pending_file_confirmation:
-            del pending_file_confirmation[chat_id]
-        
-        # Process the file normally
-        state = await get_user_state_safe(chat_id)
-        message_thread_id = query.message.message_thread_id
-        
-        # Thread-safe queue addition
-        queue_size = await add_to_queue_safe(state, file_info)
-        queue_position = get_queue_position_safe(state)
-        
-        # Check if this should start processing
-        should_start_processing = not state.processing and queue_size == 1
-        
-        if should_start_processing:
-            if 'chunks' in file_info:
-                parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
-                notification = (
-                    f"✅ File accepted: `{file_info['name']}`\n"
-                    f"Size: {file_info['size']:,} characters{parts_info}\n"
-                    f"Operation: {file_info['operation'].capitalize()}\n\n"
-                    f"🟢 Starting Your Task"
-                )
-            else:
-                parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
-                notification = (
-                    f"✅ File accepted: `{file_info['name']}`\n"
-                    f"Size: {file_info['size']:,} characters{parts_info}\n"
-                    f"Operation: {file_info['operation'].capitalize()}\n\n"
-                    f"🟢 Starting Your Task"
-                )
-            
-            sent_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text=notification,
-                disable_notification=True,
-                parse_mode='Markdown'
-            )
-            file_notification_mapping[file_info['name']] = sent_msg.message_id
-            
-            if not state.processing:
-                state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
-                
-        else:
-            if 'chunks' in file_info:
-                parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
-            else:
-                parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
-            
-            notification = (
-                f"✅ File queued: `{file_info['name']}`\n"
-                f"Size: {file_info['size']:,} characters{parts_info}\n"
-                f"Operation: {file_info['operation'].capitalize()}\n"
-                f"Position in queue: {queue_position}\n"
-                f"Queue interval: {QUEUE_INTERVAL // 60} minutes between files\n\n"
-            )
-            
-            sent_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text=notification,
-                disable_notification=True,
-                parse_mode='Markdown'
-            )
-            file_notification_mapping[file_info['name']] = sent_msg.message_id
-        
-        await query.edit_message_text(
-            text=f"✅ **Confirmed**\n\nFile `{file_info['name']}` has been added to the queue."
-        )
-        
-    elif callback_data.startswith('cancel_post_'):
-        # User cancelled posting
-        if chat_id in pending_file_confirmation:
-            del pending_file_confirmation[chat_id]
-        
-        await query.edit_message_text(
-            text="❌ **Cancelled**\n\nFile posting has been cancelled."
-        )
 
 # ==================== ADMIN COMMANDS ====================
 async def adminpreview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -644,11 +428,11 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
         return
     
     # Check against database
-    full_matches, non_matches, partial_matches = check_preview_against_database(previews)
+    matches, non_matches = check_preview_against_database(previews)
     total_previews = len(previews)
     
     # Format report exactly as requested
-    report_text = format_preview_report_exact(full_matches, non_matches, partial_matches, total_previews)
+    report_text = format_preview_report_exact(matches, non_matches, total_previews)
     
     # Send the report
     await context.bot.send_message(
@@ -682,6 +466,9 @@ def update_file_history(chat_id: int, filename: str, status: str, parts_count: i
         'messages_count': messages_count
     }
     file_history[chat_id].append(entry)
+    
+    if len(file_history[chat_id]) > 100:
+        file_history[chat_id] = file_history[chat_id][-100:]
 
 def is_authorized(user_id: int, chat_id: int) -> bool:
     return user_id in ALLOWED_IDS or chat_id in ALLOWED_IDS
@@ -1375,12 +1162,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     message_thread_id = query.message.message_thread_id
-    
-    # Check if this is a post confirmation callback
-    if callback_data.startswith('confirm_post_') or callback_data.startswith('cancel_post_'):
-        await handle_post_confirmation(update, context, callback_data, chat_id)
-        return
-    
     state = await get_user_state_safe(chat_id)
     operation = query.data
     
@@ -2058,11 +1839,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'requires_intervals': True,
                 'message_thread_id': message_thread_id
             }
-        
-        # Check if file was posted in last 72 hours
-        if check_file_duplicate_in_history(chat_id, file_name, content):
-            await ask_file_post_confirmation(update, context, file_info, chat_id, message_thread_id)
-            return
         
         # Thread-safe queue addition
         queue_size = await add_to_queue_safe(state, file_info)
