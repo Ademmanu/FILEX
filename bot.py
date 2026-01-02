@@ -9,7 +9,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Deque, Set, Tuple, Any
+from typing import Dict, List, Optional, Deque, Set, Tuple
 from collections import deque, defaultdict
 from pathlib import Path
 import csv
@@ -68,263 +68,72 @@ file_message_mapping = {}
 file_notification_mapping = {}
 file_other_notifications = {}
 
-# ==================== ENHANCED MESSAGE TRACKING SYSTEM ====================
+# ==================== ADMIN PREVIEW SYSTEM ====================
 class MessageEntry:
-    """Stores complete message with word positions"""
-    def __init__(self, chat_id: int, message_id: int, message_text: str, timestamp: datetime):
+    """Stores first two words of sent messages"""
+    def __init__(self, chat_id: int, message_id: int, first_two_words: str, timestamp: datetime):
         self.chat_id = chat_id
         self.message_id = message_id
-        self.message_text = message_text
+        self.first_two_words = first_two_words
         self.timestamp = timestamp
-        self.words = self.extract_words_with_positions(message_text)
-        self.first_two_words = self.get_first_two_words()
-    
-    def extract_words_with_positions(self, text: str) -> List[Tuple[str, int]]:
-        """Extract all words with their positions (1-indexed)"""
-        # Clean text
-        clean_text = text
-        clean_text = re.sub(r'https?://\S+', ' ', clean_text)
-        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-        
-        # Extract words with positions
-        words = []
-        for i, word in enumerate(clean_text.split(), 1):
-            words.append((word.strip(), i))
-        return words
-    
-    def get_first_two_words(self) -> str:
-        """Get first two words joined by space"""
-        if len(self.words) >= 2:
-            return f"{self.words[0][0]} {self.words[1][0]}"
-        elif len(self.words) == 1:
-            return self.words[0][0]
-        else:
-            return ""
-    
-    def find_word_positions(self, target_words: List[str]) -> Dict[str, List[int]]:
-        """Find positions of target words in this message"""
-        result = {}
-        for target_word in target_words:
-            positions = []
-            for word, position in self.words:
-                if word == target_word:
-                    positions.append(position)
-            if positions:
-                result[target_word] = positions
-        return result
     
     def is_expired(self) -> bool:
         """Check if entry is older than 72 hours"""
         return datetime.now(UTC_PLUS_1) - self.timestamp > timedelta(hours=72)
     
     def __repr__(self):
-        return f"MessageEntry(chat={self.chat_id}, words={len(self.words)}, time={self.timestamp.strftime('%H:%M:%S')})"
+        return f"MessageEntry(chat={self.chat_id}, words='{self.first_two_words}', time={self.timestamp.strftime('%H:%M:%S')})"
 
 # Global storage for message tracking
 message_tracking: List[MessageEntry] = []
-admin_preview_mode: Set[int] = set()
+MAX_TRACKED_MESSAGES = 1000
+admin_preview_mode: Set[int] = set()  # Just track which admins are in preview mode
 
-# ==================== DUPLICATE FILE DETECTION ====================
-class FileRecord:
-    """Store file details for duplicate detection"""
-    def __init__(self, filename: str, size: int, timestamp: datetime, chat_id: int):
-        self.filename = filename
-        self.size = size
-        self.timestamp = timestamp
-        self.chat_id = chat_id
-    
-    def is_duplicate(self, other_filename: str, other_size: int) -> bool:
-        """Check if this is a duplicate of another file"""
-        return (self.filename == other_filename and 
-                self.size == other_size and
-                not self.is_expired())
-    
-    def is_expired(self) -> bool:
-        """Check if record is older than 72 hours"""
-        return datetime.now(UTC_PLUS_1) - self.timestamp > timedelta(hours=72)
-    
-    def __repr__(self):
-        return f"FileRecord({self.filename}, {self.size:,} chars, {self.timestamp.strftime('%H:%M')})"
+# ==================== ADMIN FUNCTIONS ====================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-file_records: List[FileRecord] = []
+async def check_admin_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is admin"""
+    user_id = update.effective_user.id
+    
+    if is_admin(user_id):
+        return True
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        message_thread_id=update.effective_message.message_thread_id,
+        text="⛔ **Admin Access Required**\n\nThis command is for administrators only."
+    )
+    return False
 
-def add_file_record(filename: str, size: int, chat_id: int):
-    """Add a new file record for duplicate detection"""
-    record = FileRecord(filename, size, datetime.now(UTC_PLUS_1), chat_id)
-    file_records.append(record)
-    cleanup_file_records()
+# ==================== MESSAGE TRACKING FUNCTIONS ====================
+def extract_first_two_words(text: str) -> str:
+    """Extract first two words from text, handling markdown and special chars"""
+    # Remove markdown formatting but keep normal text
+    clean_text = text
+    # Remove URLs
+    clean_text = re.sub(r'https?://\S+', ' ', clean_text)
+    # Replace multiple spaces with single space
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    
+    # Split into words and take first two
+    words = clean_text.split()
+    if len(words) >= 2:
+        return f"{words[0]} {words[1]}"
+    elif len(words) == 1:
+        return words[0]
+    else:
+        return ""
 
-def cleanup_file_records():
-    """Remove expired file records"""
-    global file_records
-    initial_count = len(file_records)
-    file_records = [r for r in file_records if not r.is_expired()]
-    removed = initial_count - len(file_records)
-    if removed > 0:
-        logger.info(f"Cleaned up {removed} expired file records")
-
-def check_duplicate_file(filename: str, size: int, chat_id: int) -> Optional[FileRecord]:
-    """Check if file is a duplicate within last 72 hours"""
-    cleanup_file_records()
-    
-    for record in file_records:
-        if record.is_duplicate(filename, size) and record.chat_id == chat_id:
-            return record
-    return None
-
-# ==================== ENHANCED PREVIEW MATCHING ====================
-def extract_preview_sections(text: str) -> List[str]:
-    """Extract all 'Preview:' sections from report text - exact matching"""
-    preview_sections = []
-    
-    pattern = r'📝\s*[Pp]review:\s*(.+?)(?=\n|\r|$)'
-    matches = re.findall(pattern, text, re.DOTALL)
-    
-    for match in matches:
-        preview_text = match.strip()
-        if preview_text:
-            preview_sections.append(preview_text)
-    
-    if not preview_sections:
-        pattern2 = r'[Pp]review:\s*(.+?)(?=\n|\r|$)'
-        matches2 = re.findall(pattern2, text, re.DOTALL)
-        for match in matches2:
-            preview_text = match.strip()
-            if preview_text:
-                preview_sections.append(preview_text)
-    
-    return preview_sections
-
-def extract_words_from_preview(preview: str) -> List[str]:
-    """Extract individual words from preview text"""
-    # Remove any non-space separators and normalize
-    cleaned = re.sub(r'[^\w\s]', ' ', preview)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned.split()
-
-def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[Dict], List[Dict], List[str]]:
-    """
-    Check preview texts against tracked messages
-    Returns: (full_matches, partial_matches, non_matches)
-    """
-    if not message_tracking:
-        return ([], [], preview_texts)
-    
-    full_matches = []  # List of dicts with preview and message info
-    partial_matches = []  # List of dicts with preview, matched words, and positions
-    non_matches = []  # List of strings
-    
-    for preview in preview_texts:
-        preview_words = extract_words_from_preview(preview)
-        if not preview_words:
-            non_matches.append(preview)
-            continue
-        
-        # Get first two words for full match check
-        first_two = ' '.join(preview_words[:2]) if len(preview_words) >= 2 else preview_words[0]
-        
-        found_full_match = False
-        found_partial_match = False
-        partial_info = {
-            'preview': preview,
-            'matched_words': [],
-            'word_positions': [],
-            'source_message_id': None
-        }
-        
-        for entry in message_tracking:
-            # Check for full match (first two words exactly)
-            if entry.first_two_words == first_two:
-                full_matches.append({
-                    'preview': preview,
-                    'message_id': entry.message_id,
-                    'timestamp': entry.timestamp
-                })
-                found_full_match = True
-                break
-            
-            # Check for partial matches (individual words)
-            word_positions = entry.find_word_positions(preview_words)
-            if word_positions:
-                for word, positions in word_positions.items():
-                    if word not in partial_info['matched_words']:
-                        partial_info['matched_words'].append(word)
-                        partial_info['word_positions'].extend(positions)
-                        partial_info['source_message_id'] = entry.message_id
-                found_partial_match = True
-        
-        if found_full_match:
-            continue
-        elif found_partial_match and partial_info['matched_words']:
-            partial_matches.append(partial_info)
-        else:
-            non_matches.append(preview)
-    
-    return (full_matches, partial_matches, non_matches)
-
-def format_preview_report_enhanced(full_matches: List[Dict], partial_matches: List[Dict], 
-                                 non_matches: List[str], total_previews: int) -> str:
-    """Format the preview report with full and partial matches"""
-    
-    if total_previews == 0:
-        return "❌ **No preview content found**\n\nNo valid preview sections found in the message.\n\nUse /cancelpreview to cancel."
-    
-    report_lines = []
-    report_lines.append("📊 **Preview Analysis Report**")
-    report_lines.append("─" * 35)
-    report_lines.append("")
-    report_lines.append("📋 **Preview Analysis:**")
-    
-    full_match_count = len(full_matches)
-    partial_match_count = len(partial_matches)
-    non_match_count = len(non_matches)
-    
-    full_percent = (full_match_count / total_previews * 100) if total_previews > 0 else 0
-    partial_percent = (partial_match_count / total_previews * 100) if total_previews > 0 else 0
-    non_percent = (non_match_count / total_previews * 100) if total_previews > 0 else 0
-    
-    report_lines.append(f"• Total previews checked: {total_previews}")
-    report_lines.append(f"• Full matches found: {full_match_count} ({full_percent:.1f}%)")
-    report_lines.append(f"• Partial matches: {partial_match_count} ({partial_percent:.1f}%)")
-    report_lines.append(f"• Non-matches: {non_match_count} ({non_percent:.1f}%)")
-    report_lines.append("")
-    
-    if full_matches:
-        report_lines.append("✅ **Full matches found in database:**")
-        for i, match in enumerate(full_matches, 1):
-            report_lines.append(f"{i}. {match['preview']}")
-    
-    if partial_matches:
-        if full_matches:
-            report_lines.append("")
-        report_lines.append("⚠️ **Partial matches found:**")
-        for i, match in enumerate(partial_matches, 1):
-            report_lines.append(f"{i}. Preview: {match['preview']}")
-            if match['matched_words']:
-                words_str = ', '.join(match['matched_words'])
-                positions_str = ', '.join(str(pos) for pos in match['word_positions'])
-                report_lines.append(f"   Matched words: {words_str}")
-                report_lines.append(f"   Word positions: {positions_str}")
-                if match['source_message_id']:
-                    report_lines.append(f"   Source message ID: {match['source_message_id']}")
-    
-    if non_matches:
-        if full_matches or partial_matches:
-            report_lines.append("")
-        report_lines.append("❌ **Not found in database:**")
-        for i, non_match in enumerate(non_matches, 1):
-            report_lines.append(f"{i}. {non_match}")
-
-    report_lines.append("")
-    report_lines.append("Use /cancelpreview to cancel.")
-                                   
-    return "\n".join(report_lines)
-
-# ==================== ENHANCED MESSAGE TRACKING FUNCTIONS ====================
 def track_message(chat_id: int, message_id: int, message_text: str):
-    """Track complete message with word positions"""
+    """Track first two words of sent message"""
     try:
         if not message_text or len(message_text.strip()) < 2:
+            return
+        
+        first_two_words = extract_first_two_words(message_text)
+        if not first_two_words:
             return
         
         # Remove expired entries first
@@ -334,13 +143,17 @@ def track_message(chat_id: int, message_id: int, message_text: str):
         entry = MessageEntry(
             chat_id=chat_id,
             message_id=message_id,
-            message_text=message_text,
+            first_two_words=first_two_words,
             timestamp=datetime.now(UTC_PLUS_1)
         )
         
         message_tracking.append(entry)
         
-        logger.debug(f"Tracked message with {len(entry.words)} words: {entry.first_two_words[:50]}...")
+        # Keep only last MAX_TRACKED_MESSAGES
+        if len(message_tracking) > MAX_TRACKED_MESSAGES:
+            del message_tracking[0]
+        
+        logger.debug(f"Tracked message: {first_two_words}")
         
     except Exception as e:
         logger.error(f"Error tracking message: {e}")
@@ -372,38 +185,112 @@ def get_tracking_stats() -> Dict[str, any]:
             'total': 0,
             'oldest': None,
             'newest': None,
-            'total_words': 0
+            'unique_words': 0
         }
     
     oldest = min(entry.timestamp for entry in message_tracking)
     newest = max(entry.timestamp for entry in message_tracking)
-    total_words = sum(len(entry.words) for entry in message_tracking)
+    unique_words = len(set(entry.first_two_words for entry in message_tracking))
     
     return {
         'total': len(message_tracking),
         'oldest': oldest,
         'newest': newest,
-        'total_words': total_words
+        'unique_words': unique_words
     }
 
-# ==================== ENHANCED ADMIN FUNCTIONS ====================
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-async def check_admin_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is admin"""
-    user_id = update.effective_user.id
+# ==================== PREVIEW PROCESSING FUNCTIONS ====================
+def extract_preview_sections(text: str) -> List[str]:
+    """Extract all 'Preview:' sections from report text - exact matching"""
+    preview_sections = []
     
-    if is_admin(user_id):
-        return True
+    # Pattern to match "Preview: " followed by content until end of line
+    # This handles the specific format in your example
+    pattern = r'📝\s*[Pp]review:\s*(.+?)(?=\n|\r|$)'
     
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        message_thread_id=update.effective_message.message_thread_id,
-        text="⛔ **Admin Access Required**\n\nThis command is for administrators only."
-    )
-    return False
+    matches = re.findall(pattern, text, re.DOTALL)
+    
+    for match in matches:
+        # Clean up the match - remove trailing whitespace
+        preview_text = match.strip()
+        if preview_text:
+            preview_sections.append(preview_text)
+    
+    # If no matches with emoji format, try without emoji
+    if not preview_sections:
+        pattern2 = r'[Pp]review:\s*(.+?)(?=\n|\r|$)'
+        matches2 = re.findall(pattern2, text, re.DOTALL)
+        for match in matches2:
+            preview_text = match.strip()
+            if preview_text:
+                preview_sections.append(preview_text)
+    
+    return preview_sections
 
+def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Check preview texts against tracked messages
+    Returns: (matches, non_matches)
+    """
+    if not message_tracking:
+        return ([], preview_texts)
+    
+    # Get all unique first_two_words from database
+    tracked_words = {entry.first_two_words for entry in message_tracking}
+    
+    matches = []
+    non_matches = []
+    
+    for preview in preview_texts:
+        # Extract first two words from preview text
+        preview_words = extract_first_two_words(preview)
+        
+        if preview_words and preview_words in tracked_words:
+            matches.append(preview)
+        else:
+            non_matches.append(preview)
+    
+    return (matches, non_matches)
+
+def format_preview_report_exact(matches: List[str], non_matches: List[str], 
+                               total_previews: int) -> str:
+    """Format the preview report exactly like the example provided"""
+    
+    if total_previews == 0:
+        return "❌ **No preview content found**\n\nNo valid preview sections found in the message.\n\nUse /cancelpreview to cancel."
+    
+    report_lines = []
+    report_lines.append("📊 **Preview Analysis Report**")
+    report_lines.append("─" * 35)
+    report_lines.append("")
+    report_lines.append("📋 **Preview Analysis:**")
+    
+    match_percent = (len(matches) / total_previews * 100) if total_previews > 0 else 0
+    non_match_percent = (len(non_matches) / total_previews * 100) if total_previews > 0 else 0
+    
+    report_lines.append(f"• Total previews checked: {total_previews}")
+    report_lines.append(f"• Matches found: {len(matches)} ({match_percent:.1f}%)")
+    report_lines.append(f"• Non-matches: {len(non_matches)} ({non_match_percent:.1f}%)")
+    report_lines.append("")
+    
+    if matches:
+        report_lines.append("✅ **Matches found in database:**")
+        for i, match in enumerate(matches, 1):
+            report_lines.append(f"{i}. {match}")
+    
+    if non_matches:
+        if matches:
+            report_lines.append("")
+        report_lines.append("⚠️ **Not found in database:**")
+        for i, non_match in enumerate(non_matches, 1):
+            report_lines.append(f"{i}. {non_match}")
+
+    report_lines.append("")
+    report_lines.append("Use /cancelpreview to cancel.")
+                                   
+    return "\n".join(report_lines)
+
+# ==================== ADMIN COMMANDS ====================
 async def adminpreview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command to start preview mode"""
     if not await check_admin_authorization(update, context):
@@ -476,6 +363,7 @@ async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     oldest_str = stats['oldest'].strftime('%Y-%m-%d %H:%M:%S')
     newest_str = stats['newest'].strftime('%Y-%m-%d %H:%M:%S')
     
+    # Calculate expiration time
     if stats['oldest']:
         expires_in = stats['oldest'] + timedelta(hours=72) - datetime.now(UTC_PLUS_1)
         expires_hours = max(0, expires_in.total_seconds() / 3600)
@@ -484,7 +372,7 @@ async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     message = f"📊 **Message Tracking Statistics**\n\n"
     message += f"**Total tracked messages:** {stats['total']}\n"
-    message += f"**Total words tracked:** {stats['total_words']}\n"
+    message += f"**Unique word pairs:** {stats['unique_words']}\n"
     message += f"**Oldest entry:** {oldest_str}\n"
     message += f"**Newest entry:** {newest_str}\n"
     message += f"**Expires in:** {expires_hours:.1f}h\n"
@@ -508,6 +396,7 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
     
+    # Extract previews from the message
     message_text = update.message.text
     if not message_text or not message_text.strip():
         await context.bot.send_message(
@@ -520,6 +409,7 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
         )
         return
     
+    # Extract previews using exact format matching
     previews = extract_preview_sections(message_text)
     
     if not previews:
@@ -537,12 +427,12 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
         )
         return
     
-    # Check against database with enhanced matching
-    full_matches, partial_matches, non_matches = check_preview_against_database(previews)
+    # Check against database
+    matches, non_matches = check_preview_against_database(previews)
     total_previews = len(previews)
     
-    # Format enhanced report
-    report_text = format_preview_report_enhanced(full_matches, partial_matches, non_matches, total_previews)
+    # Format report exactly as requested
+    report_text = format_preview_report_exact(matches, non_matches, total_previews)
     
     # Send the report
     await context.bot.send_message(
@@ -552,306 +442,18 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
         parse_mode='Markdown'
     )
 
-# ==================== DUPLICATE FILE CONFIRMATION ====================
-class DuplicateConfirmation:
-    """Handle duplicate file confirmation states"""
-    def __init__(self):
-        self.pending_confirmations: Dict[int, Dict] = {}  # chat_id -> file_info
-    
-    def add_confirmation(self, chat_id: int, file_info: Dict):
-        """Add pending confirmation"""
-        self.pending_confirmations[chat_id] = file_info
-    
-    def get_confirmation(self, chat_id: int) -> Optional[Dict]:
-        """Get pending confirmation"""
-        return self.pending_confirmations.get(chat_id)
-    
-    def remove_confirmation(self, chat_id: int):
-        """Remove pending confirmation"""
-        if chat_id in self.pending_confirmations:
-            del self.pending_confirmations[chat_id]
-
-duplicate_confirmation = DuplicateConfirmation()
-
-async def handle_duplicate_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle duplicate file confirmation button clicks"""
-    query = update.callback_query
-    await query.answer()
-    
-    chat_id = query.message.chat_id
-    user_id = query.from_user.id
-    message_thread_id = query.message.message_thread_id
-    
-    if not is_authorized(user_id, chat_id):
-        return
-    
-    data = query.data
-    file_info = duplicate_confirmation.get_confirmation(chat_id)
-    
-    if not file_info:
-        await query.edit_message_text(
-            text="❌ **Confirmation expired**\n\n"
-                 "The duplicate file confirmation has expired. Please upload the file again.",
-            parse_mode='Markdown'
-        )
-        return
-    
-    if data == 'duplicate_yes':
-        # User confirmed - process file
-        duplicate_confirmation.remove_confirmation(chat_id)
-        
-        await query.edit_message_text(
-            text=f"✅ **Processing duplicate file**\n\n"
-                 f"File: `{file_info['name']}`\n"
-                 f"Size: {file_info['size']:,} characters\n\n"
-                 f"Adding to queue...",
-            parse_mode='Markdown'
-        )
-        
-        # Process the file (add to queue)
-        await process_file_to_queue(chat_id, message_thread_id, file_info, context)
-        
-    elif data == 'duplicate_no':
-        # User declined
-        duplicate_confirmation.remove_confirmation(chat_id)
-        
-        await query.edit_message_text(
-            text=f"❌ **Duplicate file rejected**\n\n"
-                 f"File `{file_info['name']}` will not be processed.",
-            parse_mode='Markdown'
-        )
-        
-    elif data == 'duplicate_cancel':
-        # User cancelled
-        duplicate_confirmation.remove_confirmation(chat_id)
-        
-        await query.edit_message_text(
-            text="🚫 **Operation cancelled**\n\n"
-                 "Duplicate file check cancelled.",
-            parse_mode='Markdown'
-        )
-
-# ==================== ENHANCED DELETION SYSTEM ====================
-class DeletionState:
-    """Manage deletion states for users"""
-    def __init__(self):
-        self.waiting_for_filename: Dict[int, bool] = {}
-        self.duplicate_files: Dict[int, List[Dict]] = {}
-        self.last_deleted: Dict[int, str] = {}
-    
-    def set_waiting(self, chat_id: int, waiting: bool):
-        self.waiting_for_filename[chat_id] = waiting
-    
-    def is_waiting(self, chat_id: int) -> bool:
-        return self.waiting_for_filename.get(chat_id, False)
-    
-    def set_duplicates(self, chat_id: int, files: List[Dict]):
-        self.duplicate_files[chat_id] = files
-    
-    def get_duplicates(self, chat_id: int) -> List[Dict]:
-        return self.duplicate_files.get(chat_id, [])
-    
-    def clear_duplicates(self, chat_id: int):
-        if chat_id in self.duplicate_files:
-            del self.duplicate_files[chat_id]
-    
-    def set_last_deleted(self, chat_id: int, filename: str):
-        self.last_deleted[chat_id] = filename
-    
-    def get_last_deleted(self, chat_id: int) -> Optional[str]:
-        return self.last_deleted.get(chat_id)
-    
-    def clear_state(self, chat_id: int):
-        if chat_id in self.waiting_for_filename:
-            del self.waiting_for_filename[chat_id]
-        if chat_id in self.duplicate_files:
-            del self.duplicate_files[chat_id]
-        if chat_id in self.last_deleted:
-            del self.last_deleted[chat_id]
-
-deletion_state = DeletionState()
-
-async def handle_deletion_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle file selection for deletion when duplicates exist"""
-    query = update.callback_query
-    await query.answer()
-    
-    chat_id = query.message.chat_id
-    user_id = query.from_user.id
-    message_thread_id = query.message.message_thread_id
-    
-    if not is_authorized(user_id, chat_id):
-        return
-    
-    data = query.data
-    
-    if data == 'delete_cancel':
-        # User cancelled deletion
-        deletion_state.clear_state(chat_id)
-        
-        await query.edit_message_text(
-            text="🚫 **Deletion cancelled**\n\n"
-                 "No files were deleted.",
-            parse_mode='Markdown'
-        )
-        return
-    
-    if data.startswith('delete_file_'):
-        # User selected a file to delete
+# ==================== PERIODIC CLEANUP TASK ====================
+async def periodic_cleanup_task():
+    """Periodically clean up old messages and stuck tasks"""
+    while True:
         try:
-            file_index = int(data.split('_')[2])
-            duplicate_files = deletion_state.get_duplicates(chat_id)
-            
-            if file_index < 0 or file_index >= len(duplicate_files):
-                await query.edit_message_text(
-                    text="❌ **Invalid selection**\n\n"
-                         "Please try again with /delfilecontent.",
-                    parse_mode='Markdown'
-                )
-                deletion_state.clear_state(chat_id)
-                return
-            
-            file_info = duplicate_files[file_index]
-            filename = file_info['filename']
-            
-            # Process deletion
-            await query.edit_message_text(
-                text=f"🗑️ **Deleting file content...**\n\n"
-                     f"File: `{filename}`\n"
-                     f"Processing...",
-                parse_mode='Markdown'
-            )
-            
-            # Perform deletion
-            success = await perform_file_deletion(chat_id, message_thread_id, filename, context, file_info)
-            
-            if success:
-                deletion_state.set_last_deleted(chat_id, filename)
-            
-            deletion_state.clear_state(chat_id)
-            
-        except (IndexError, ValueError) as e:
-            logger.error(f"Error processing deletion selection: {e}")
-            await query.edit_message_text(
-                text="❌ **Error processing selection**\n\n"
-                     "Please try again with /delfilecontent.",
-                parse_mode='Markdown'
-            )
-            deletion_state.clear_state(chat_id)
+            cleanup_old_messages()
+            cleanup_stuck_tasks()
+            await asyncio.sleep(3600)  # Run every hour
+        except Exception as e:
+            logger.error(f"Error in periodic cleanup task: {e}")
+            await asyncio.sleep(300)
 
-async def perform_file_deletion(chat_id: int, message_thread_id: Optional[int], filename: str, 
-                               context: ContextTypes.DEFAULT_TYPE, file_info: Dict) -> bool:
-    """Perform actual file deletion"""
-    try:
-        state = await get_user_state_safe(chat_id)
-        
-        # Check if file is currently being processed
-        is_currently_processing = False
-        if state.queue and state.queue[0].get('name') == filename and state.processing:
-            is_currently_processing = True
-            state.cancel_current_task()
-            if state.queue:
-                state.queue.popleft()
-        
-        messages_to_delete = 0
-        deleted_messages = []
-        
-        # Delete content messages
-        if filename in file_message_mapping:
-            messages_to_delete += len(file_message_mapping[filename])
-            for msg_id in file_message_mapping[filename]:
-                try:
-                    await context.bot.delete_message(
-                        chat_id=chat_id,
-                        message_id=msg_id
-                    )
-                    deleted_messages.append(msg_id)
-                except Exception as e:
-                    logger.error(f"Failed to delete content message {msg_id}: {e}")
-        
-        # Delete other notifications
-        if filename in file_other_notifications:
-            for msg_id in file_other_notifications[filename]:
-                try:
-                    await context.bot.delete_message(
-                        chat_id=chat_id,
-                        message_id=msg_id
-                    )
-                    messages_to_delete += 1
-                    deleted_messages.append(msg_id)
-                except Exception as e:
-                    logger.error(f"Failed to delete other notification {msg_id}: {e}")
-        
-        # Edit notification message if exists
-        if filename in file_notification_mapping:
-            notification_msg_id = file_notification_mapping[filename]
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=notification_msg_id,
-                    text=f"🗑️ **File Content Deleted**\n\n"
-                         f"File: `{filename}`\n"
-                         f"Messages deleted: {messages_to_delete}\n"
-                         f"All content from this file has been removed.",
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.error(f"Failed to edit notification message: {e}")
-        
-        # Update history
-        update_file_history(chat_id, filename, 'deleted')
-        
-        # Remove from queue if present
-        state.remove_task_by_name(filename)
-        
-        # Clean up tracking
-        await cleanup_completed_file(filename, chat_id)
-        
-        # Send confirmation
-        await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text=f"✅ **File content deleted**\n\n"
-                 f"File: `{filename}`\n"
-                 f"Messages removed: {len(deleted_messages)}\n"
-                 f"Status: {file_info.get('status', 'Unknown')}",
-            parse_mode='Markdown'
-        )
-        
-        # Resume processing if needed
-        if is_currently_processing and state.queue and not state.processing:
-            next_file = state.queue[0].get('name', 'Unknown')
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text=f"🔄 **Moving to next task**\n\n"
-                     f"Starting next task: `{next_file}`",
-                parse_mode='Markdown'
-            )
-            state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
-        elif is_currently_processing and not state.queue:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text="🏁 **Processing stopped**\n\n"
-                     "No more tasks in queue.",
-                parse_mode='Markdown'
-            )
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error in perform_file_deletion: {e}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text=f"❌ **Deletion failed**\n\n"
-                 f"Error: {str(e)[:200]}",
-            parse_mode='Markdown'
-        )
-        return False
-
-# ==================== UPDATED BOT FUNCTIONS ====================
 def update_file_history(chat_id: int, filename: str, status: str, parts_count: int = 0, messages_count: int = 0):
     file_history[chat_id] = [entry for entry in file_history.get(chat_id, []) 
                            if entry['filename'] != filename]
@@ -918,6 +520,7 @@ class UserState:
         self.last_send = None
         self.processing_task: Optional[asyncio.Task] = None
         self.cancel_requested = False
+        self.waiting_for_filename = False
         self.last_deleted_file = None
         self.processing_start_time = None
         
@@ -1147,7 +750,7 @@ def process_csv_file(file_bytes: bytes, operation: str) -> str:
 
 async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                                     message: str, message_thread_id: Optional[int] = None, 
-                                    retries: int = 5, filename: Optional[str] = None,
+                                    retries: int = 5, filename: Optional[str] = None,  # Increased retries
                                     notification_type: str = 'content') -> bool:
     for attempt in range(retries):
         try:
@@ -1198,11 +801,12 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_sent += 1
                 
+                # Added: Delay between messages to prevent rate limiting
                 if i < len(chunks):
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for `{filename}`")
-                return False
+                return False  # Stop on failure
         
         state = await get_user_state_safe(chat_id)
         state.last_send = datetime.now(UTC_PLUS_1)
@@ -1249,24 +853,25 @@ async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TY
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_in_part += 1
                 
+                # Added: Delay between messages to prevent rate limiting
                 if i < len(chunks):
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
                 logger.error(f"Failed to send chunk {i} for part {part_num} of `{filename}`")
-                return 0
+                return 0  # Return 0 on failure
         
-        return total_messages_in_part
+        return total_messages_in_part  # Return actual count
         
     except Exception as e:
         logger.error(f"Error sending large content part: {e}")
-        return 0
+        return 0  # Return 0 on error
 
 async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                             parts: List[str], filename: str, state: UserState, 
                             message_thread_id: Optional[int] = None) -> bool:
     try:
         total_parts = len(parts)
-        total_messages_sent = 0
+        total_messages_sent = 0  # Initialize total messages counter
         
         for i, part in enumerate(parts, 1):
             if state.cancel_requested:
@@ -1285,17 +890,18 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
                 chat_id, context, part, i, total_parts, filename, message_thread_id
             )
             
-            if not messages_in_part:
+            if not messages_in_part:  # Check for 0 (failure) instead of <= 0
                 logger.error(f"Failed to send part {i} of `{filename}`")
                 return False
             
-            total_messages_sent += messages_in_part
+            total_messages_sent += messages_in_part  # Accumulate actual messages
             
             state.last_send = datetime.now(UTC_PLUS_1)
             
             if i < total_parts:
                 await asyncio.sleep(SEND_INTERVAL * 60)
         
+        # Use actual messages count, not parts count
         completion_msg = await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
@@ -1339,6 +945,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
     
     try:
         while state.queue and not state.cancel_requested:
+            # Check for processing timeout
             if (datetime.now(UTC_PLUS_1) - state.processing_start_time).total_seconds() > MAX_PROCESSING_TIME:
                 logger.warning(f"Processing timeout for chat {chat_id}")
                 state.cancel_current_task()
@@ -1399,6 +1006,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     file_message_thread_id
                 )
             
+            # Always remove the file from queue after processing (success or failure)
             if state.queue and state.queue[0]['name'] == filename:
                 processed_file = state.queue.popleft()
                 processed_filename = processed_file['name']
@@ -1420,6 +1028,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
             state.current_parts = []
             state.current_index = 0
             
+            # Wait 2 minutes before processing next file (if any remain)
             if state.queue and not state.cancel_requested:
                 next_file = state.queue[0]['name']
                 next_file_msg = await context.bot.send_message(
@@ -1430,6 +1039,7 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     parse_mode='Markdown'
                 )
                 
+                # Wait for QUEUE_INTERVAL seconds
                 wait_start = datetime.now(UTC_PLUS_1)
                 while (datetime.now(UTC_PLUS_1) - wait_start).seconds < QUEUE_INTERVAL:
                     if state.cancel_requested:
@@ -1940,12 +1550,32 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
     
     chat_id = update.effective_chat.id
     message_thread_id = update.effective_message.message_thread_id
+    state = await get_user_state_safe(chat_id)
     
-    # Set waiting state
-    deletion_state.set_waiting(chat_id, True)
+    if state.waiting_for_filename:
+        filename = update.message.text.strip()
+        
+        if filename == state.last_deleted_file:
+            state.waiting_for_filename = False
+            state.last_deleted_file = None
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"⚠️ **File already deleted**\n\n"
+                     f"`{filename}` was already deleted in the previous operation.\n"
+                     f"Use /delfilecontent to delete a different file.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        state.waiting_for_filename = False
+        state.last_deleted_file = filename
+        
+        await process_file_deletion(chat_id, message_thread_id, filename, context, state)
+        return
     
-    # Create inline keyboard with cancel button
-    keyboard = [[InlineKeyboardButton("🚫 Cancel", callback_data="delete_cancel")]]
+    state.waiting_for_filename = True
+    state.last_deleted_file = None
     
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1953,149 +1583,146 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
         text="🗑️ **Delete File Content**\n\n"
              "Please send me the filename you want to delete content from.\n"
              "Example: `Sudan WhatsApp.txt`\n\n"
-             "Click Cancel to cancel this operation.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+             "Type `cancel` to cancel this operation.",
         parse_mode='Markdown'
     )
 
-async def process_file_to_queue(chat_id: int, message_thread_id: Optional[int], file_info: Dict, 
-                               context: ContextTypes.DEFAULT_TYPE):
-    """Process file and add to queue (used after duplicate confirmation)"""
-    state = await get_user_state_safe(chat_id)
-    
-    # Thread-safe queue addition
-    queue_size = await add_to_queue_safe(state, file_info)
-    queue_position = get_queue_position_safe(state)
-    
-    # Check if this should start processing
-    should_start_processing = not state.processing and queue_size == 1
-    
-    if should_start_processing:
-        if 'chunks' in file_info:
-            parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
-            notification = (
-                f"✅ File accepted: `{file_info['name']}`\n"
-                f"Size: {file_info['size']:,} characters{parts_info}\n"
-                f"Operation: {state.operation.capitalize()}\n\n"
-                f"🟢 Starting Your Task"
-            )
-        else:
-            parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
-            notification = (
-                f"✅ File accepted: `{file_info['name']}`\n"
-                f"Size: {file_info['size']:,} characters{parts_info}\n"
-                f"Operation: {state.operation.capitalize()}\n\n"
-                f"🟢 Starting Your Task"
-            )
-        
-        sent_msg = await context.bot.send_message(
+async def process_file_deletion(chat_id: int, message_thread_id: Optional[int], filename: str, 
+                                context: ContextTypes.DEFAULT_TYPE, state: UserState):
+    if filename.lower() == 'cancel':
+        state.waiting_for_filename = False
+        state.last_deleted_file = None
+        await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
-            text=notification,
-            disable_notification=True,
+            text="❌ **Operation cancelled**",
             parse_mode='Markdown'
         )
-        file_notification_mapping[file_info['name']] = sent_msg.message_id
-        
-        if not state.processing:
-            state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
-            
-    else:
-        if 'chunks' in file_info:
-            parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
-        else:
-            parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
-        
-        notification = (
-            f"✅ File queued: `{file_info['name']}`\n"
-            f"Size: {file_info['size']:,} characters{parts_info}\n"
-            f"Operation: {state.operation.capitalize()}\n"
-            f"Position in queue: {queue_position}\n"
-            f"Queue interval: {QUEUE_INTERVAL // 60} minutes between files\n\n"
-        )
-        
-        sent_msg = await context.bot.send_message(
+        return
+    
+    file_exists = any(
+        entry['filename'] == filename 
+        for entry in file_history.get(chat_id, [])
+    )
+    
+    if not file_exists:
+        state.waiting_for_filename = False
+        state.last_deleted_file = None
+        await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
-            text=notification,
-            disable_notification=True,
+            text=f"❌ **File not found**\n\n"
+                 f"No record found for `{filename}` in your history.\n\n"
+                 f"Use /delfilecontent to try again with a different filename.",
             parse_mode='Markdown'
         )
-        file_notification_mapping[file_info['name']] = sent_msg.message_id
+        return
+    
+    is_currently_processing = False
+    if state.queue and state.queue[0].get('name') == filename and state.processing:
+        is_currently_processing = True
+        state.cancel_current_task()
+        if state.queue:
+            state.queue.popleft()
+    
+    messages_to_delete = 0
+    deleted_messages = []
+    
+    if filename in file_message_mapping:
+        messages_to_delete += len(file_message_mapping[filename])
+        for msg_id in file_message_mapping[filename]:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=msg_id
+                )
+                deleted_messages.append(msg_id)
+                logger.info(f"Deleted content message {msg_id} for file {filename}")
+            except Exception as e:
+                logger.error(f"Failed to delete content message {msg_id}: {e}")
+    
+    if filename in file_other_notifications:
+        for msg_id in file_other_notifications[filename]:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=msg_id
+                )
+                messages_to_delete += 1
+                deleted_messages.append(msg_id)
+                logger.info(f"Deleted other notification message {msg_id} for file {filename}")
+            except Exception as e:
+                logger.error(f"Failed to delete other notification message {msg_id}: {e}")
+    
+    notification_edited = False
+    if filename in file_notification_mapping:
+        notification_msg_id = file_notification_mapping[filename]
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=notification_msg_id,
+                text=f"🗑️ **File Content Deleted**\n\n"
+                     f"File: `{filename}`\n"
+                     f"Messages deleted: {messages_to_delete}\n"
+                     f"All content from this file has been removed.",
+                parse_mode='Markdown'
+            )
+            notification_edited = True
+            logger.info(f"Edited acceptance/queued notification for {filename}")
+        except Exception as e:
+            logger.error(f"Failed to edit notification message: {e}")
+    
+    update_file_history(chat_id, filename, 'deleted')
+    
+    state.remove_task_by_name(filename)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=message_thread_id,
+        text=f"🗑️ `{filename}` content deleted\n"
+             f"Messages removed: {len(deleted_messages)}",
+        parse_mode='Markdown'
+    )
+    
+    state.waiting_for_filename = False
+    
+    if is_currently_processing and state.queue and not state.processing:
+        next_file = state.queue[0].get('name', 'Unknown')
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"🔄 **Moving to next task**\n\n"
+                 f"Starting next task: `{next_file}`",
+            parse_mode='Markdown'
+        )
+        state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
+    elif is_currently_processing and not state.queue:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text="🏁 **Processing stopped**\n\n"
+                 "No more tasks in queue.",
+            parse_mode='Markdown'
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
         return
     
     chat_id = update.effective_chat.id
+    state = await get_user_state_safe(chat_id)
     
-    # Check if admin is in preview mode
+    # Check if waiting for filename (deletion flow) - MUST CHECK THIS FIRST
+    if state.waiting_for_filename:
+        message_thread_id = update.effective_message.message_thread_id
+        await process_file_deletion(chat_id, message_thread_id, update.message.text.strip(), context, state)
+        return
+    
+    # Check if admin is in preview mode (AFTER checking deletion flow)
     user_id = update.effective_user.id
     if user_id in admin_preview_mode:
         await handle_admin_preview_message(update, context)
         return
-    
-    # Check if waiting for filename (deletion flow)
-    if deletion_state.is_waiting(chat_id):
-        message_thread_id = update.effective_message.message_thread_id
-        filename = update.message.text.strip()
-        
-        # Check for duplicate files
-        duplicate_files = []
-        for entry in file_history.get(chat_id, []):
-            if entry['filename'] == filename:
-                duplicate_files.append(entry)
-        
-        if not duplicate_files:
-            # No files found
-            deletion_state.clear_state(chat_id)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text=f"❌ **File not found**\n\n"
-                     f"No record found for `{filename}` in your history.\n\n"
-                     f"Use /delfilecontent to try again with a different filename.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        elif len(duplicate_files) == 1:
-            # Single file found - proceed with deletion
-            file_info = duplicate_files[0]
-            success = await perform_file_deletion(chat_id, message_thread_id, filename, context, file_info)
-            if success:
-                deletion_state.set_last_deleted(chat_id, filename)
-            deletion_state.clear_state(chat_id)
-            
-        else:
-            # Multiple files with same name - ask user to choose
-            deletion_state.set_duplicates(chat_id, duplicate_files)
-            
-            selection_text = f"🔍 Found {len(duplicate_files)} files with name `{filename}`:\n\n"
-            
-            keyboard = []
-            for i, file_info in enumerate(duplicate_files):
-                time_str = file_info['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-                size_info = f" ({(file_info.get('parts_count', 0) or file_info.get('messages_count', 0))} items)" if file_info.get('parts_count', 0) or file_info.get('messages_count', 0) else ""
-                
-                selection_text += f"{i+1}. 📄 `{file_info['filename']}`\n"
-                selection_text += f"   Processed: {time_str}\n"
-                selection_text += f"   Status: {file_info['status'].capitalize()}{size_info}\n\n"
-                
-                keyboard.append([InlineKeyboardButton(
-                    f"{i+1}️⃣ Delete ({time_str})", 
-                    callback_data=f"delete_file_{i}"
-                )])
-            
-            keyboard.append([InlineKeyboardButton("🚫 Cancel", callback_data="delete_cancel")])
-            
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text=selection_text + "Which one do you want to delete?",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
@@ -2105,8 +1732,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_thread_id = update.effective_message.message_thread_id
     state = await get_user_state_safe(chat_id)
     
-    # Clear deletion states
-    deletion_state.clear_state(chat_id)
+    state.waiting_for_filename = False
+    state.last_deleted_file = None
+    
     state.cancel_requested = False
     
     if not update.message.document:
@@ -2134,6 +1762,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    # Check queue size thread-safely
     queue_position = get_queue_position_safe(state)
     if queue_position >= MAX_QUEUE_SIZE:
         await context.bot.send_message(
@@ -2147,12 +1776,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
+        # Added timeout for file download to prevent "Timed out" error
         file = await context.bot.get_file(doc.file_id)
         
+        # Download with timeout
         try:
             file_bytes = await asyncio.wait_for(
                 file.download_as_bytearray(),
-                timeout=30.0
+                timeout=30.0  # 30 second timeout for file download
             )
         except asyncio.TimeoutError:
             await context.bot.send_message(
@@ -2186,10 +1817,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         content_size = len(content)
         
-        # Check for duplicate file
-        duplicate_record = check_duplicate_file(file_name, content_size, chat_id)
-        
-        # Prepare file info
         if content_size <= CONTENT_LIMIT_FOR_INTERVALS:
             chunks = split_into_telegram_chunks_without_cutting_words(content, TELEGRAM_MESSAGE_LIMIT)
             file_info = {
@@ -2213,42 +1840,66 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'message_thread_id': message_thread_id
             }
         
-        # If duplicate found, ask for confirmation
-        if duplicate_record:
-            time_diff = datetime.now(UTC_PLUS_1) - duplicate_record.timestamp
-            hours_ago = time_diff.total_seconds() / 3600
+        # Thread-safe queue addition
+        queue_size = await add_to_queue_safe(state, file_info)
+        queue_position = get_queue_position_safe(state)
+        
+        # Check if this should start processing
+        should_start_processing = not state.processing and queue_size == 1
+        
+        if should_start_processing:
+            if 'chunks' in file_info:
+                parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
+                notification = (
+                    f"✅ File accepted: `{file_name}`\n"
+                    f"Size: {content_size:,} characters{parts_info}\n"
+                    f"Operation: {state.operation.capitalize()}\n\n"
+                    f"🟢 Starting Your Task"
+                )
+            else:
+                parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
+                notification = (
+                    f"✅ File accepted: `{file_name}`\n"
+                    f"Size: {content_size:,} characters{parts_info}\n"
+                    f"Operation: {state.operation.capitalize()}\n\n"
+                    f"🟢 Starting Your Task"
+                )
             
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Yes, Post", callback_data="duplicate_yes"),
-                    InlineKeyboardButton("❌ No, Don't", callback_data="duplicate_no")
-                ],
-                [InlineKeyboardButton("🚫 Cancel", callback_data="duplicate_cancel")]
-            ]
-            
-            await context.bot.send_message(
+            sent_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
-                text=f"⚠️ **Duplicate File Detected**\n\n"
-                     f"File: `{file_name}`\n"
-                     f"Size: {content_size:,} characters\n\n"
-                     f"This exact file was processed {hours_ago:.1f} hours ago.\n"
-                     f"Do you want to post it again?\n\n"
-                     f"*Note: File will be added to queue if you choose 'Yes, Post'*",
-                reply_markup=InlineKeyboardMarkup(keyboard),
+                text=notification,
+                disable_notification=True,
                 parse_mode='Markdown'
             )
+            file_notification_mapping[file_name] = sent_msg.message_id
             
-            # Store file info for confirmation handling
-            duplicate_confirmation.add_confirmation(chat_id, file_info)
-            return
-        
-        # No duplicate or confirmed - process normally
-        await process_file_to_queue(chat_id, message_thread_id, file_info, context)
-        
-        # Add to file records for duplicate detection
-        add_file_record(file_name, content_size, chat_id)
-        
+            if not state.processing:
+                state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
+                
+        else:
+            if 'chunks' in file_info:
+                parts_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
+            else:
+                parts_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
+            
+            notification = (
+                f"✅ File queued: `{file_name}`\n"
+                f"Size: {content_size:,} characters{parts_info}\n"
+                f"Operation: {state.operation.capitalize()}\n"
+                f"Position in queue: {queue_position}\n"
+                f"Queue interval: {QUEUE_INTERVAL // 60} minutes between files\n\n"
+            )
+            
+            sent_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=notification,
+                disable_notification=True,
+                parse_mode='Markdown'
+            )
+            file_notification_mapping[file_name] = sent_msg.message_id
+            
     except asyncio.TimeoutError:
         logger.error(f"File processing timeout for {file_name}")
         await context.bot.send_message(
@@ -2277,8 +1928,7 @@ async def health_handler(request):
             "allowed_ids_count": len(ALLOWED_IDS),
             "admin_ids_count": len(ADMIN_IDS),
             "tracked_messages": len(message_tracking),
-            "admin_preview_sessions": len(admin_preview_mode),
-            "file_records": len(file_records)
+            "admin_preview_sessions": len(admin_preview_mode)
         }),
         content_type='application/json'
     )
@@ -2296,19 +1946,6 @@ async def start_web_server():
     
     logger.info(f"Health check server running on port {PORT}")
     return runner
-
-# ==================== PERIODIC CLEANUP TASK ====================
-async def periodic_cleanup_task():
-    """Periodically clean up old messages and stuck tasks"""
-    while True:
-        try:
-            cleanup_old_messages()
-            cleanup_file_records()
-            cleanup_stuck_tasks()
-            await asyncio.sleep(3600)
-        except Exception as e:
-            logger.error(f"Error in periodic cleanup task: {e}")
-            await asyncio.sleep(300)
 
 async def main():
     if not TOKEN:
@@ -2346,10 +1983,7 @@ async def main():
     application.add_handler(CommandHandler("cancelpreview", cancelpreview_command))
     application.add_handler(CommandHandler("adminstats", adminstats_command))
     
-    # Add callback handlers
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(all|number|alphabet)$"))
-    application.add_handler(CallbackQueryHandler(handle_duplicate_confirmation, pattern="^duplicate_"))
-    application.add_handler(CallbackQueryHandler(handle_deletion_selection, pattern="^(delete_file_|delete_cancel)$"))
+    application.add_handler(CallbackQueryHandler(button_handler))
     
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
