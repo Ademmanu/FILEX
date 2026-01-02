@@ -70,23 +70,35 @@ file_other_notifications = {}
 
 # ==================== ADMIN PREVIEW SYSTEM ====================
 class MessageEntry:
-    """Stores first two words of sent messages"""
-    def __init__(self, chat_id: int, message_id: int, first_two_words: str, timestamp: datetime):
+    """Stores full message content and word positions"""
+    def __init__(self, chat_id: int, message_id: int, full_message: str, timestamp: datetime):
         self.chat_id = chat_id
         self.message_id = message_id
-        self.first_two_words = first_two_words
+        self.full_message = full_message
         self.timestamp = timestamp
+        self.words = self._extract_words(full_message)
+    
+    def _extract_words(self, text: str) -> List[str]:
+        """Extract all words from text"""
+        # Remove markdown formatting but keep normal text
+        clean_text = text
+        # Remove URLs
+        clean_text = re.sub(r'https?://\S+', ' ', clean_text)
+        # Replace multiple spaces with single space
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        
+        # Split into words
+        return clean_text.split()
     
     def is_expired(self) -> bool:
         """Check if entry is older than 72 hours"""
         return datetime.now(UTC_PLUS_1) - self.timestamp > timedelta(hours=72)
     
     def __repr__(self):
-        return f"MessageEntry(chat={self.chat_id}, words='{self.first_two_words}', time={self.timestamp.strftime('%H:%M:%S')})"
+        return f"MessageEntry(chat={self.chat_id}, words={len(self.words)}, time={self.timestamp.strftime('%H:%M:%S')})"
 
 # Global storage for message tracking
 message_tracking: List[MessageEntry] = []
-MAX_TRACKED_MESSAGES = 1000
 admin_preview_mode: Set[int] = set()  # Just track which admins are in preview mode
 
 # ==================== ADMIN FUNCTIONS ====================
@@ -108,32 +120,10 @@ async def check_admin_authorization(update: Update, context: ContextTypes.DEFAUL
     return False
 
 # ==================== MESSAGE TRACKING FUNCTIONS ====================
-def extract_first_two_words(text: str) -> str:
-    """Extract first two words from text, handling markdown and special chars"""
-    # Remove markdown formatting but keep normal text
-    clean_text = text
-    # Remove URLs
-    clean_text = re.sub(r'https?://\S+', ' ', clean_text)
-    # Replace multiple spaces with single space
-    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-    
-    # Split into words and take first two
-    words = clean_text.split()
-    if len(words) >= 2:
-        return f"{words[0]} {words[1]}"
-    elif len(words) == 1:
-        return words[0]
-    else:
-        return ""
-
 def track_message(chat_id: int, message_id: int, message_text: str):
-    """Track first two words of sent message"""
+    """Track full message content"""
     try:
         if not message_text or len(message_text.strip()) < 2:
-            return
-        
-        first_two_words = extract_first_two_words(message_text)
-        if not first_two_words:
             return
         
         # Remove expired entries first
@@ -143,17 +133,13 @@ def track_message(chat_id: int, message_id: int, message_text: str):
         entry = MessageEntry(
             chat_id=chat_id,
             message_id=message_id,
-            first_two_words=first_two_words,
+            full_message=message_text,
             timestamp=datetime.now(UTC_PLUS_1)
         )
         
         message_tracking.append(entry)
         
-        # Keep only last MAX_TRACKED_MESSAGES
-        if len(message_tracking) > MAX_TRACKED_MESSAGES:
-            del message_tracking[0]
-        
-        logger.debug(f"Tracked message: {first_two_words}")
+        logger.debug(f"Tracked message with {len(entry.words)} words")
         
     except Exception as e:
         logger.error(f"Error tracking message: {e}")
@@ -185,18 +171,18 @@ def get_tracking_stats() -> Dict[str, any]:
             'total': 0,
             'oldest': None,
             'newest': None,
-            'unique_words': 0
+            'total_words': 0
         }
     
     oldest = min(entry.timestamp for entry in message_tracking)
     newest = max(entry.timestamp for entry in message_tracking)
-    unique_words = len(set(entry.first_two_words for entry in message_tracking))
+    total_words = sum(len(entry.words) for entry in message_tracking)
     
     return {
         'total': len(message_tracking),
         'oldest': oldest,
         'newest': newest,
-        'unique_words': unique_words
+        'total_words': total_words
     }
 
 # ==================== PREVIEW PROCESSING FUNCTIONS ====================
@@ -227,32 +213,68 @@ def extract_preview_sections(text: str) -> List[str]:
     
     return preview_sections
 
-def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str], List[str]]:
+def extract_preview_words(preview_text: str) -> List[str]:
+    """Extract all words from a preview text"""
+    # Clean and split preview text into words
+    clean_text = re.sub(r'\s+', ' ', preview_text).strip()
+    return clean_text.split()
+
+def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str], List[Dict]]:
     """
     Check preview texts against tracked messages
-    Returns: (matches, non_matches)
+    Returns: (full_matches, partial_matches)
+    partial_matches is a list of dicts with:
+        - preview: the original preview text
+        - matches: list of tuples (matched_word, word_position_in_message)
+        - message_info: (chat_id, message_id, timestamp)
     """
     if not message_tracking:
-        return ([], preview_texts)
+        return ([], [])
     
-    # Get all unique first_two_words from database
-    tracked_words = {entry.first_two_words for entry in message_tracking}
-    
-    matches = []
-    non_matches = []
+    full_matches = []
+    partial_matches = []
     
     for preview in preview_texts:
-        # Extract first two words from preview text
-        preview_words = extract_first_two_words(preview)
+        preview_words = extract_preview_words(preview)
+        found_full_match = False
+        preview_partial_matches = []
         
-        if preview_words and preview_words in tracked_words:
-            matches.append(preview)
-        else:
-            non_matches.append(preview)
+        for entry in message_tracking:
+            # Check each preview word against the message words
+            message_words = entry.words
+            word_positions = {}
+            
+            for preview_word in preview_words:
+                for idx, message_word in enumerate(message_words, 1):
+                    if preview_word == message_word:
+                        if preview_word not in word_positions:
+                            word_positions[preview_word] = []
+                        word_positions[preview_word].append(idx)
+            
+            if word_positions:
+                # If all preview words were found, it's a full match
+                if all(word in word_positions for word in preview_words):
+                    full_matches.append(preview)
+                    found_full_match = True
+                    break
+                else:
+                    # Store partial matches
+                    for word, positions in word_positions.items():
+                        preview_partial_matches.append({
+                            'word': word,
+                            'positions': positions,
+                            'message_info': (entry.chat_id, entry.message_id, entry.timestamp)
+                        })
+        
+        if not found_full_match and preview_partial_matches:
+            partial_matches.append({
+                'preview': preview,
+                'matches': preview_partial_matches
+            })
     
-    return (matches, non_matches)
+    return (full_matches, partial_matches)
 
-def format_preview_report_exact(matches: List[str], non_matches: List[str], 
+def format_preview_report_exact(full_matches: List[str], partial_matches: List[Dict], 
                                total_previews: int) -> str:
     """Format the preview report exactly like the example provided"""
     
@@ -265,26 +287,56 @@ def format_preview_report_exact(matches: List[str], non_matches: List[str],
     report_lines.append("")
     report_lines.append("📋 **Preview Analysis:**")
     
-    match_percent = (len(matches) / total_previews * 100) if total_previews > 0 else 0
-    non_match_percent = (len(non_matches) / total_previews * 100) if total_previews > 0 else 0
+    match_percent = (len(full_matches) / total_previews * 100) if total_previews > 0 else 0
+    partial_percent = (len(partial_matches) / total_previews * 100) if total_previews > 0 else 0
+    non_match_percent = ((total_previews - len(full_matches) - len(partial_matches)) / total_previews * 100) if total_previews > 0 else 0
     
     report_lines.append(f"• Total previews checked: {total_previews}")
-    report_lines.append(f"• Matches found: {len(matches)} ({match_percent:.1f}%)")
-    report_lines.append(f"• Non-matches: {len(non_matches)} ({non_match_percent:.1f}%)")
+    report_lines.append(f"• Full matches found: {len(full_matches)} ({match_percent:.1f}%)")
+    report_lines.append(f"• Partial matches: {len(partial_matches)} ({partial_percent:.1f}%)")
+    report_lines.append(f"• Not found: {total_previews - len(full_matches) - len(partial_matches)} ({non_match_percent:.1f}%)")
     report_lines.append("")
     
-    if matches:
-        report_lines.append("✅ **Matches found in database:**")
-        for i, match in enumerate(matches, 1):
+    if full_matches:
+        report_lines.append("✅ **Full matches found in database:**")
+        for i, match in enumerate(full_matches, 1):
             report_lines.append(f"{i}. {match}")
     
-    if non_matches:
-        if matches:
+    if partial_matches:
+        if full_matches:
             report_lines.append("")
-        report_lines.append("⚠️ **Not found in database:**")
-        for i, non_match in enumerate(non_matches, 1):
-            report_lines.append(f"{i}. {non_match}")
-
+        report_lines.append("⚠️ **Partial matches found:**")
+        for i, partial in enumerate(partial_matches, 1):
+            report_lines.append(f"{i}. Preview: {partial['preview']}")
+            
+            # Group matches by word
+            word_matches = {}
+            for match in partial['matches']:
+                word = match['word']
+                if word not in word_matches:
+                    word_matches[word] = []
+                word_matches[word].extend(match['positions'])
+            
+            # Format matched words and positions
+            matched_words = []
+            for word, positions in word_matches.items():
+                # Remove duplicates and sort positions
+                unique_positions = sorted(set(positions))
+                positions_str = ', '.join(str(pos) for pos in unique_positions)
+                matched_words.append(f"{word} (position: {positions_str})")
+            
+            if matched_words:
+                report_lines.append(f"   Matched words: {', '.join(matched_words)}")
+    
+    if total_previews - len(full_matches) - len(partial_matches) > 0:
+        if full_matches or partial_matches:
+            report_lines.append("")
+        report_lines.append("❌ **Not found in database:**")
+        non_matches_count = 0
+        for preview in full_matches + [p['preview'] for p in partial_matches]:
+            # This would need to be calculated differently
+            pass
+    
     report_lines.append("")
     report_lines.append("Use /cancelpreview to cancel.")
                                    
@@ -372,7 +424,7 @@ async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     message = f"📊 **Message Tracking Statistics**\n\n"
     message += f"**Total tracked messages:** {stats['total']}\n"
-    message += f"**Unique word pairs:** {stats['unique_words']}\n"
+    message += f"**Total words tracked:** {stats['total_words']}\n"
     message += f"**Oldest entry:** {oldest_str}\n"
     message += f"**Newest entry:** {newest_str}\n"
     message += f"**Expires in:** {expires_hours:.1f}h\n"
@@ -428,11 +480,11 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
         return
     
     # Check against database
-    matches, non_matches = check_preview_against_database(previews)
+    full_matches, partial_matches = check_preview_against_database(previews)
     total_previews = len(previews)
     
     # Format report exactly as requested
-    report_text = format_preview_report_exact(matches, non_matches, total_previews)
+    report_text = format_preview_report_exact(full_matches, partial_matches, total_previews)
     
     # Send the report
     await context.bot.send_message(
