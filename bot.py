@@ -87,6 +87,25 @@ class FileUploadRecord:
 # Global storage for file upload tracking
 file_upload_tracking: List[FileUploadRecord] = []
 
+# ==================== MESSAGE TRACKING SYSTEM ====================
+class MessageEntry:
+    """Stores first two words of sent messages"""
+    def __init__(self, chat_id: int, message_id: int, first_two_words: str, timestamp: datetime):
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.first_two_words = first_two_words
+        self.timestamp = timestamp
+    
+    def is_expired(self) -> bool:
+        """Check if entry is older than 72 hours"""
+        return datetime.now(UTC_PLUS_1) - self.timestamp > timedelta(hours=72)
+    
+    def __repr__(self):
+        return f"MessageEntry(chat={self.chat_id}, words='{self.first_two_words}', time={self.timestamp.strftime('%H:%M:%S')})"
+
+# Global storage for message tracking (OLD SYSTEM - for compatibility)
+message_tracking: List[MessageEntry] = []
+
 # ==================== ENHANCED MESSAGE TRACKING SYSTEM ====================
 class EnhancedMessageEntry:
     """Stores complete message with word positions"""
@@ -163,9 +182,96 @@ async def check_admin_authorization(update: Update, context: ContextTypes.DEFAUL
     )
     return False
 
+# ==================== MESSAGE TRACKING FUNCTIONS (OLD SYSTEM) ====================
+def extract_first_two_words(text: str) -> str:
+    """Extract first two words from text, handling markdown and special chars"""
+    # Remove markdown formatting but keep normal text
+    clean_text = text
+    # Remove URLs
+    clean_text = re.sub(r'https?://\S+', ' ', clean_text)
+    # Replace multiple spaces with single space
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    
+    # Split into words and take first two
+    words = clean_text.split()
+    if len(words) >= 2:
+        return f"{words[0]} {words[1]}"
+    elif len(words) == 1:
+        return words[0]
+    else:
+        return ""
+
+def track_message(chat_id: int, message_id: int, message_text: str):
+    """Track first two words of sent message (OLD SYSTEM)"""
+    try:
+        if not message_text or len(message_text.strip()) < 2:
+            return
+        
+        first_two_words = extract_first_two_words(message_text)
+        if not first_two_words:
+            return
+        
+        # Remove expired entries first
+        cleanup_old_messages()
+        
+        # Add new entry
+        entry = MessageEntry(
+            chat_id=chat_id,
+            message_id=message_id,
+            first_two_words=first_two_words,
+            timestamp=datetime.now(UTC_PLUS_1)
+        )
+        
+        message_tracking.append(entry)
+        
+        logger.debug(f"Tracked message (old system): {first_two_words}")
+        
+    except Exception as e:
+        logger.error(f"Error tracking message (old system): {e}")
+
+def cleanup_old_messages():
+    """Remove messages older than 72 hours (OLD SYSTEM)"""
+    global message_tracking
+    
+    if not message_tracking:
+        return
+    
+    cutoff = datetime.now(UTC_PLUS_1) - timedelta(hours=72)
+    initial_count = len(message_tracking)
+    
+    # Filter out expired messages
+    message_tracking = [entry for entry in message_tracking if not entry.is_expired()]
+    
+    removed = initial_count - len(message_tracking)
+    if removed > 0:
+        logger.info(f"Cleaned up {removed} expired message entries (old system, older than 72h)")
+
+def get_tracking_stats() -> Dict[str, any]:
+    """Get statistics about tracked messages (OLD SYSTEM)"""
+    cleanup_old_messages()
+    
+    if not message_tracking:
+        return {
+            'total': 0,
+            'oldest': None,
+            'newest': None,
+            'unique_words': 0
+        }
+    
+    oldest = min(entry.timestamp for entry in message_tracking)
+    newest = max(entry.timestamp for entry in message_tracking)
+    unique_words = len(set(entry.first_two_words for entry in message_tracking))
+    
+    return {
+        'total': len(message_tracking),
+        'oldest': oldest,
+        'newest': newest,
+        'unique_words': unique_words
+    }
+
 # ==================== ENHANCED MESSAGE TRACKING FUNCTIONS ====================
 def track_message_enhanced(chat_id: int, message_id: int, message_text: str):
-    """Track complete message with word positions"""
+    """Track complete message with word positions (NEW SYSTEM)"""
     try:
         if not message_text or len(message_text.strip()) < 2:
             return
@@ -189,7 +295,7 @@ def track_message_enhanced(chat_id: int, message_id: int, message_text: str):
         logger.error(f"Error tracking enhanced message: {e}")
 
 def cleanup_old_messages_enhanced():
-    """Remove messages older than 72 hours (NO MAX LIMIT)"""
+    """Remove messages older than 72 hours (NEW SYSTEM - NO MAX LIMIT)"""
     global enhanced_message_tracking
     
     if not enhanced_message_tracking:
@@ -203,11 +309,11 @@ def cleanup_old_messages_enhanced():
     
     removed = initial_count - len(enhanced_message_tracking)
     if removed > 0:
-        logger.info(f"Cleaned up {removed} expired message entries (older than 72h)")
-        logger.info(f"Current database: {len(enhanced_message_tracking)} active entries")
+        logger.info(f"Cleaned up {removed} expired message entries (enhanced system, older than 72h)")
+        logger.info(f"Current enhanced database: {len(enhanced_message_tracking)} active entries")
 
 def get_enhanced_tracking_stats() -> Dict[str, any]:
-    """Get statistics about tracked messages"""
+    """Get statistics about tracked messages (NEW SYSTEM)"""
     cleanup_old_messages_enhanced()
     
     if not enhanced_message_tracking:
@@ -521,37 +627,31 @@ async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not await check_admin_authorization(update, context):
         return
     
-    stats = get_enhanced_tracking_stats()
-    
-    if stats['total'] == 0:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            message_thread_id=update.effective_message.message_thread_id,
-            text="📊 **Enhanced Message Tracking Statistics**\n\n"
-                 "No messages tracked yet.\n"
-                 "Database is empty.",
-            parse_mode='Markdown'
-        )
-        return
-    
-    oldest_str = stats['oldest'].strftime('%Y-%m-%d %H:%M:%S')
-    newest_str = stats['newest'].strftime('%Y-%m-%d %H:%M:%S')
-    
-    # Calculate expiration time
-    if stats['oldest']:
-        expires_in = stats['oldest'] + timedelta(hours=72) - datetime.now(UTC_PLUS_1)
-        expires_hours = max(0, expires_in.total_seconds() / 3600)
-    else:
-        expires_hours = 0
+    old_stats = get_tracking_stats()
+    new_stats = get_enhanced_tracking_stats()
     
     message = f"📊 **Enhanced Message Tracking Statistics**\n\n"
-    message += f"**Total tracked messages:** {stats['total']}\n"
-    message += f"**Total words tracked:** {stats['total_words']}\n"
-    message += f"**Unique words:** {stats['unique_words']}\n"
-    message += f"**Oldest entry:** {oldest_str}\n"
-    message += f"**Newest entry:** {newest_str}\n"
-    message += f"**Expires in:** {expires_hours:.1f}h\n"
-    message += f"**Active preview sessions:** {len(admin_preview_mode)}\n\n"
+    message += f"**OLD SYSTEM (first two words only):**\n"
+    message += f"• Total tracked messages: {old_stats['total']}\n"
+    message += f"• Unique word pairs: {old_stats['unique_words']}\n\n"
+    
+    message += f"**NEW SYSTEM (complete messages):**\n"
+    message += f"• Total tracked messages: {new_stats['total']}\n"
+    message += f"• Total words tracked: {new_stats['total_words']}\n"
+    message += f"• Unique words: {new_stats['unique_words']}\n\n"
+    
+    if new_stats['oldest']:
+        message += f"**Oldest entry:** {new_stats['oldest'].strftime('%Y-%m-%d %H:%M:%S')}\n"
+    if new_stats['newest']:
+        message += f"**Newest entry:** {new_stats['newest'].strftime('%Y-%m-%d %H:%M:%S')}\n"
+    
+    # Calculate expiration time
+    if new_stats['oldest']:
+        expires_in = new_stats['oldest'] + timedelta(hours=72) - datetime.now(UTC_PLUS_1)
+        expires_hours = max(0, expires_in.total_seconds() / 3600)
+        message += f"**Expires in:** {expires_hours:.1f}h\n"
+    
+    message += f"**Active preview sessions:** {len(admin_preview_mode)}\n"
     message += f"**File upload records:** {len(file_upload_tracking)} (last 72h)\n\n"
     message += f"Messages auto-delete after 72 hours."
 
@@ -623,7 +723,9 @@ async def periodic_cleanup_task():
     """Periodically clean up old messages, file uploads and stuck tasks"""
     while True:
         try:
-            cleanup_old_messages_enhanced()
+            # Clean up both old and new tracking systems
+            cleanup_old_messages()  # Old system
+            cleanup_old_messages_enhanced()  # New system
             cleanup_old_file_uploads()
             cleanup_stuck_tasks()
             await asyncio.sleep(3600)  # Run every hour
@@ -946,9 +1048,10 @@ async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT
                 parse_mode='Markdown'
             )
             
-            # Track message for enhanced admin preview system
+            # Track message in BOTH systems for compatibility
             if sent_message and sent_message.text:
-                track_message_enhanced(chat_id, sent_message.message_id, sent_message.text)
+                track_message(chat_id, sent_message.message_id, sent_message.text)  # OLD SYSTEM
+                track_message_enhanced(chat_id, sent_message.message_id, sent_message.text)  # NEW SYSTEM
             
             if filename and sent_message:
                 if notification_type == 'content':
@@ -2246,7 +2349,8 @@ async def health_handler(request):
             "active_users": len(user_states),
             "allowed_ids_count": len(ALLOWED_IDS),
             "admin_ids_count": len(ADMIN_IDS),
-            "tracked_messages": len(enhanced_message_tracking),
+            "tracked_messages_old": len(message_tracking),
+            "tracked_messages_new": len(enhanced_message_tracking),
             "file_upload_records": len(file_upload_tracking),
             "admin_preview_sessions": len(admin_preview_mode)
         }),
