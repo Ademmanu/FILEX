@@ -9,7 +9,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Deque, Set, Tuple
+from typing import Dict, List, Optional, Deque, Set, Tuple, Any
 from collections import deque, defaultdict
 from pathlib import Path
 import csv
@@ -68,26 +68,82 @@ file_message_mapping = {}
 file_notification_mapping = {}
 file_other_notifications = {}
 
-# ==================== ADMIN PREVIEW SYSTEM ====================
-class MessageEntry:
-    """Stores first two words of sent messages"""
-    def __init__(self, chat_id: int, message_id: int, first_two_words: str, timestamp: datetime):
+# ==================== FILE UPLOAD TRACKING ====================
+class FileUploadRecord:
+    """Track file uploads to detect duplicates"""
+    def __init__(self, chat_id: int, filename: str, file_size: int, timestamp: datetime):
+        self.chat_id = chat_id
+        self.filename = filename
+        self.file_size = file_size
+        self.timestamp = timestamp
+    
+    def is_expired(self) -> bool:
+        """Check if record is older than 72 hours"""
+        return datetime.now(UTC_PLUS_1) - self.timestamp > timedelta(hours=72)
+    
+    def __repr__(self):
+        return f"FileUploadRecord({self.filename}, size={self.file_size}, time={self.timestamp.strftime('%H:%M:%S')})"
+
+# Global storage for file upload tracking
+file_upload_tracking: List[FileUploadRecord] = []
+
+# ==================== ENHANCED MESSAGE TRACKING SYSTEM ====================
+class EnhancedMessageEntry:
+    """Stores complete message with word positions"""
+    def __init__(self, chat_id: int, message_id: int, message_text: str, timestamp: datetime):
         self.chat_id = chat_id
         self.message_id = message_id
-        self.first_two_words = first_two_words
+        self.message_text = message_text
         self.timestamp = timestamp
+        self.words = self._extract_words_with_positions(message_text)
+        self.first_two_words = self._get_first_two_words()
+    
+    def _extract_words_with_positions(self, text: str) -> Dict[str, List[int]]:
+        """Extract all words and their positions in the message"""
+        # Clean the text
+        clean_text = text
+        clean_text = re.sub(r'https?://\S+', ' ', clean_text)
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        
+        # Extract words with positions
+        words_dict = defaultdict(list)
+        words = clean_text.split()
+        for position, word in enumerate(words, 1):
+            words_dict[word].append(position)
+        
+        return dict(words_dict)
+    
+    def _get_first_two_words(self) -> str:
+        """Get first two words of the message"""
+        if not self.message_text:
+            return ""
+        
+        clean_text = self.message_text
+        clean_text = re.sub(r'https?://\S+', ' ', clean_text)
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        
+        words = clean_text.split()
+        if len(words) >= 2:
+            return f"{words[0]} {words[1]}"
+        elif len(words) == 1:
+            return words[0]
+        else:
+            return ""
     
     def is_expired(self) -> bool:
         """Check if entry is older than 72 hours"""
         return datetime.now(UTC_PLUS_1) - self.timestamp > timedelta(hours=72)
     
+    def find_word_positions(self, word: str) -> List[int]:
+        """Find positions of a specific word in the message"""
+        return self.words.get(word, [])
+    
     def __repr__(self):
-        return f"MessageEntry(chat={self.chat_id}, words='{self.first_two_words}', time={self.timestamp.strftime('%H:%M:%S')})"
+        return f"EnhancedMessageEntry(chat={self.chat_id}, words='{self.first_two_words[:30]}...', time={self.timestamp.strftime('%H:%M:%S')})"
 
-# Global storage for message tracking
-message_tracking: List[MessageEntry] = []
-MAX_TRACKED_MESSAGES = 1000
-admin_preview_mode: Set[int] = set()  # Just track which admins are in preview mode
+# Global storage for enhanced message tracking
+enhanced_message_tracking: List[EnhancedMessageEntry] = []
+admin_preview_mode: Set[int] = set()
 
 # ==================== ADMIN FUNCTIONS ====================
 def is_admin(user_id: int) -> bool:
@@ -107,111 +163,147 @@ async def check_admin_authorization(update: Update, context: ContextTypes.DEFAUL
     )
     return False
 
-# ==================== MESSAGE TRACKING FUNCTIONS ====================
-def extract_first_two_words(text: str) -> str:
-    """Extract first two words from text, handling markdown and special chars"""
-    # Remove markdown formatting but keep normal text
-    clean_text = text
-    # Remove URLs
-    clean_text = re.sub(r'https?://\S+', ' ', clean_text)
-    # Replace multiple spaces with single space
-    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-    
-    # Split into words and take first two
-    words = clean_text.split()
-    if len(words) >= 2:
-        return f"{words[0]} {words[1]}"
-    elif len(words) == 1:
-        return words[0]
-    else:
-        return ""
-
-def track_message(chat_id: int, message_id: int, message_text: str):
-    """Track first two words of sent message"""
+# ==================== ENHANCED MESSAGE TRACKING FUNCTIONS ====================
+def track_message_enhanced(chat_id: int, message_id: int, message_text: str):
+    """Track complete message with word positions"""
     try:
         if not message_text or len(message_text.strip()) < 2:
             return
         
-        first_two_words = extract_first_two_words(message_text)
-        if not first_two_words:
-            return
-        
         # Remove expired entries first
-        cleanup_old_messages()
+        cleanup_old_messages_enhanced()
         
         # Add new entry
-        entry = MessageEntry(
+        entry = EnhancedMessageEntry(
             chat_id=chat_id,
             message_id=message_id,
-            first_two_words=first_two_words,
+            message_text=message_text,
             timestamp=datetime.now(UTC_PLUS_1)
         )
         
-        message_tracking.append(entry)
+        enhanced_message_tracking.append(entry)
         
-        # Keep only last MAX_TRACKED_MESSAGES
-        if len(message_tracking) > MAX_TRACKED_MESSAGES:
-            del message_tracking[0]
-        
-        logger.debug(f"Tracked message: {first_two_words}")
+        logger.debug(f"Tracked enhanced message with {len(entry.words)} unique words")
         
     except Exception as e:
-        logger.error(f"Error tracking message: {e}")
+        logger.error(f"Error tracking enhanced message: {e}")
 
-def cleanup_old_messages():
-    """Remove messages older than 72 hours"""
-    global message_tracking
+def cleanup_old_messages_enhanced():
+    """Remove messages older than 72 hours (NO MAX LIMIT)"""
+    global enhanced_message_tracking
     
-    if not message_tracking:
+    if not enhanced_message_tracking:
         return
     
     cutoff = datetime.now(UTC_PLUS_1) - timedelta(hours=72)
-    initial_count = len(message_tracking)
+    initial_count = len(enhanced_message_tracking)
     
     # Filter out expired messages
-    message_tracking = [entry for entry in message_tracking if not entry.is_expired()]
+    enhanced_message_tracking = [entry for entry in enhanced_message_tracking if not entry.is_expired()]
     
-    removed = initial_count - len(message_tracking)
+    removed = initial_count - len(enhanced_message_tracking)
     if removed > 0:
         logger.info(f"Cleaned up {removed} expired message entries (older than 72h)")
-        logger.info(f"Current database: {len(message_tracking)} active entries")
+        logger.info(f"Current database: {len(enhanced_message_tracking)} active entries")
 
-def get_tracking_stats() -> Dict[str, any]:
+def get_enhanced_tracking_stats() -> Dict[str, any]:
     """Get statistics about tracked messages"""
-    cleanup_old_messages()
+    cleanup_old_messages_enhanced()
     
-    if not message_tracking:
+    if not enhanced_message_tracking:
         return {
             'total': 0,
             'oldest': None,
             'newest': None,
+            'total_words': 0,
             'unique_words': 0
         }
     
-    oldest = min(entry.timestamp for entry in message_tracking)
-    newest = max(entry.timestamp for entry in message_tracking)
-    unique_words = len(set(entry.first_two_words for entry in message_tracking))
+    oldest = min(entry.timestamp for entry in enhanced_message_tracking)
+    newest = max(entry.timestamp for entry in enhanced_message_tracking)
+    total_words = sum(len(entry.words) for entry in enhanced_message_tracking)
+    unique_words = len(set(word for entry in enhanced_message_tracking for word in entry.words.keys()))
     
     return {
-        'total': len(message_tracking),
+        'total': len(enhanced_message_tracking),
         'oldest': oldest,
         'newest': newest,
+        'total_words': total_words,
         'unique_words': unique_words
     }
 
-# ==================== PREVIEW PROCESSING FUNCTIONS ====================
+# ==================== FILE UPLOAD TRACKING FUNCTIONS ====================
+def track_file_upload(chat_id: int, filename: str, file_size: int):
+    """Track file upload to detect duplicates"""
+    try:
+        # Remove expired records first
+        cleanup_old_file_uploads()
+        
+        # Add new record
+        record = FileUploadRecord(
+            chat_id=chat_id,
+            filename=filename,
+            file_size=file_size,
+            timestamp=datetime.now(UTC_PLUS_1)
+        )
+        
+        file_upload_tracking.append(record)
+        
+        logger.debug(f"Tracked file upload: {filename} ({file_size} chars)")
+        
+    except Exception as e:
+        logger.error(f"Error tracking file upload: {e}")
+
+def cleanup_old_file_uploads():
+    """Remove file upload records older than 72 hours"""
+    global file_upload_tracking
+    
+    if not file_upload_tracking:
+        return
+    
+    cutoff = datetime.now(UTC_PLUS_1) - timedelta(hours=72)
+    initial_count = len(file_upload_tracking)
+    
+    # Filter out expired records
+    file_upload_tracking = [record for record in file_upload_tracking if not record.is_expired()]
+    
+    removed = initial_count - len(file_upload_tracking)
+    if removed > 0:
+        logger.info(f"Cleaned up {removed} expired file upload records")
+
+def check_file_duplicate(chat_id: int, filename: str, file_size: int) -> Optional[Dict[str, Any]]:
+    """Check if same file (name + size) was uploaded in last 72 hours"""
+    cleanup_old_file_uploads()
+    
+    for record in file_upload_tracking:
+        if (record.chat_id == chat_id and 
+            record.filename == filename and 
+            record.file_size == file_size):
+            
+            # Calculate time difference
+            time_diff = datetime.now(UTC_PLUS_1) - record.timestamp
+            hours_ago = time_diff.total_seconds() / 3600
+            
+            return {
+                'exists': True,
+                'timestamp': record.timestamp,
+                'hours_ago': hours_ago,
+                'file_size': file_size
+            }
+    
+    return {'exists': False}
+
+# ==================== ENHANCED PREVIEW PROCESSING ====================
 def extract_preview_sections(text: str) -> List[str]:
     """Extract all 'Preview:' sections from report text - exact matching"""
     preview_sections = []
     
     # Pattern to match "Preview: " followed by content until end of line
-    # This handles the specific format in your example
     pattern = r'📝\s*[Pp]review:\s*(.+?)(?=\n|\r|$)'
     
     matches = re.findall(pattern, text, re.DOTALL)
     
     for match in matches:
-        # Clean up the match - remove trailing whitespace
         preview_text = match.strip()
         if preview_text:
             preview_sections.append(preview_text)
@@ -227,34 +319,87 @@ def extract_preview_sections(text: str) -> List[str]:
     
     return preview_sections
 
-def check_preview_against_database(preview_texts: List[str]) -> Tuple[List[str], List[str]]:
+def check_preview_against_database_enhanced(preview_texts: List[str]) -> Tuple[
+    List[Dict[str, Any]],  # Full matches
+    List[Dict[str, Any]],  # Partial matches
+    List[str]              # Non-matches
+]:
     """
-    Check preview texts against tracked messages
-    Returns: (matches, non_matches)
+    Check preview texts against enhanced message database
+    Returns: (full_matches, partial_matches, non_matches)
     """
-    if not message_tracking:
-        return ([], preview_texts)
+    cleanup_old_messages_enhanced()
     
-    # Get all unique first_two_words from database
-    tracked_words = {entry.first_two_words for entry in message_tracking}
+    if not enhanced_message_tracking:
+        return ([], [], preview_texts)
     
-    matches = []
+    full_matches = []
+    partial_matches = []
     non_matches = []
     
     for preview in preview_texts:
-        # Extract first two words from preview text
-        preview_words = extract_first_two_words(preview)
+        # Extract all words from preview
+        preview_words = preview.split()
+        if not preview_words:
+            non_matches.append(preview)
+            continue
         
-        if preview_words and preview_words in tracked_words:
-            matches.append(preview)
+        # Check for full match (first two words)
+        preview_first_two = ' '.join(preview_words[:2]) if len(preview_words) >= 2 else preview_words[0]
+        is_full_match = False
+        
+        for entry in enhanced_message_tracking:
+            if entry.first_two_words == preview_first_two:
+                full_matches.append({
+                    'preview_text': preview,
+                    'match_type': 'full',
+                    'matched_words': preview_first_two,
+                    'message_entry': entry
+                })
+                is_full_match = True
+                break
+        
+        if is_full_match:
+            continue
+        
+        # Check for partial matches
+        partial_match_info = []
+        matched_words_info = []
+        
+        for word in preview_words:
+            for entry in enhanced_message_tracking:
+                positions = entry.find_word_positions(word)
+                if positions:
+                    # Get message snippet for context
+                    words_list = entry.message_text.split()
+                    context_start = max(0, positions[0] - 3)
+                    context_end = min(len(words_list), positions[0] + 2)
+                    context = ' '.join(words_list[context_start:context_end])
+                    
+                    matched_words_info.append({
+                        'word': word,
+                        'positions': positions,
+                        'message_context': context,
+                        'message_timestamp': entry.timestamp
+                    })
+                    break  # Found in at least one message
+        
+        if matched_words_info:
+            partial_matches.append({
+                'preview_text': preview,
+                'match_type': 'partial',
+                'matched_words_info': matched_words_info
+            })
         else:
             non_matches.append(preview)
     
-    return (matches, non_matches)
+    return (full_matches, partial_matches, non_matches)
 
-def format_preview_report_exact(matches: List[str], non_matches: List[str], 
-                               total_previews: int) -> str:
-    """Format the preview report exactly like the example provided"""
+def format_preview_report_enhanced(full_matches: List[Dict[str, Any]], 
+                                  partial_matches: List[Dict[str, Any]], 
+                                  non_matches: List[str], 
+                                  total_previews: int) -> str:
+    """Format the enhanced preview report"""
     
     if total_previews == 0:
         return "❌ **No preview content found**\n\nNo valid preview sections found in the message.\n\nUse /cancelpreview to cancel."
@@ -265,23 +410,52 @@ def format_preview_report_exact(matches: List[str], non_matches: List[str],
     report_lines.append("")
     report_lines.append("📋 **Preview Analysis:**")
     
-    match_percent = (len(matches) / total_previews * 100) if total_previews > 0 else 0
-    non_match_percent = (len(non_matches) / total_previews * 100) if total_previews > 0 else 0
+    full_match_count = len(full_matches)
+    partial_match_count = len(partial_matches)
+    non_match_count = len(non_matches)
+    
+    full_percent = (full_match_count / total_previews * 100) if total_previews > 0 else 0
+    partial_percent = (partial_match_count / total_previews * 100) if total_previews > 0 else 0
+    non_percent = (non_match_count / total_previews * 100) if total_previews > 0 else 0
     
     report_lines.append(f"• Total previews checked: {total_previews}")
-    report_lines.append(f"• Matches found: {len(matches)} ({match_percent:.1f}%)")
-    report_lines.append(f"• Non-matches: {len(non_matches)} ({non_match_percent:.1f}%)")
+    report_lines.append(f"• Full matches: {full_match_count} ({full_percent:.1f}%)")
+    report_lines.append(f"• Partial matches: {partial_match_count} ({partial_percent:.1f}%)")
+    report_lines.append(f"• Non-matches: {non_match_count} ({non_percent:.1f}%)")
     report_lines.append("")
     
-    if matches:
-        report_lines.append("✅ **Matches found in database:**")
-        for i, match in enumerate(matches, 1):
-            report_lines.append(f"{i}. {match}")
+    if full_matches:
+        report_lines.append("✅ **Full matches found in database:**")
+        for i, match in enumerate(full_matches, 1):
+            report_lines.append(f"{i}. {match['preview_text']}")
+    
+    if partial_matches:
+        if full_matches:
+            report_lines.append("")
+        report_lines.append("⚠️ **Partial matches found:**")
+        for i, match in enumerate(partial_matches, 1):
+            report_lines.append(f"{i}. Preview: {match['preview_text']}")
+            
+            # Group matched words by word
+            word_groups = defaultdict(list)
+            for word_info in match['matched_words_info']:
+                word_groups[word_info['word']].extend(word_info['positions'])
+            
+            # Format matched words and positions
+            matched_words_list = []
+            position_list = []
+            for word, positions in word_groups.items():
+                matched_words_list.append(word)
+                position_list.extend([str(pos) for pos in positions])
+            
+            if matched_words_list:
+                report_lines.append(f"   Matched words: {', '.join(matched_words_list)}")
+                report_lines.append(f"   Word positions: {', '.join(position_list)}")
     
     if non_matches:
-        if matches:
+        if full_matches or partial_matches:
             report_lines.append("")
-        report_lines.append("⚠️ **Not found in database:**")
+        report_lines.append("❌ **Not found in database:**")
         for i, non_match in enumerate(non_matches, 1):
             report_lines.append(f"{i}. {non_match}")
 
@@ -343,17 +517,17 @@ async def cancelpreview_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to show tracking statistics"""
+    """Admin command to show enhanced tracking statistics"""
     if not await check_admin_authorization(update, context):
         return
     
-    stats = get_tracking_stats()
+    stats = get_enhanced_tracking_stats()
     
     if stats['total'] == 0:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             message_thread_id=update.effective_message.message_thread_id,
-            text="📊 **Message Tracking Statistics**\n\n"
+            text="📊 **Enhanced Message Tracking Statistics**\n\n"
                  "No messages tracked yet.\n"
                  "Database is empty.",
             parse_mode='Markdown'
@@ -370,15 +544,17 @@ async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         expires_hours = 0
     
-    message = f"📊 **Message Tracking Statistics**\n\n"
+    message = f"📊 **Enhanced Message Tracking Statistics**\n\n"
     message += f"**Total tracked messages:** {stats['total']}\n"
-    message += f"**Unique word pairs:** {stats['unique_words']}\n"
+    message += f"**Total words tracked:** {stats['total_words']}\n"
+    message += f"**Unique words:** {stats['unique_words']}\n"
     message += f"**Oldest entry:** {oldest_str}\n"
     message += f"**Newest entry:** {newest_str}\n"
     message += f"**Expires in:** {expires_hours:.1f}h\n"
     message += f"**Active preview sessions:** {len(admin_preview_mode)}\n\n"
+    message += f"**File upload records:** {len(file_upload_tracking)} (last 72h)\n\n"
     message += f"Messages auto-delete after 72 hours."
-    
+
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         message_thread_id=update.effective_message.message_thread_id,
@@ -427,12 +603,12 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
         )
         return
     
-    # Check against database
-    matches, non_matches = check_preview_against_database(previews)
+    # Check against enhanced database
+    full_matches, partial_matches, non_matches = check_preview_against_database_enhanced(previews)
     total_previews = len(previews)
     
-    # Format report exactly as requested
-    report_text = format_preview_report_exact(matches, non_matches, total_previews)
+    # Format enhanced report
+    report_text = format_preview_report_enhanced(full_matches, partial_matches, non_matches, total_previews)
     
     # Send the report
     await context.bot.send_message(
@@ -444,10 +620,11 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
 
 # ==================== PERIODIC CLEANUP TASK ====================
 async def periodic_cleanup_task():
-    """Periodically clean up old messages and stuck tasks"""
+    """Periodically clean up old messages, file uploads and stuck tasks"""
     while True:
         try:
-            cleanup_old_messages()
+            cleanup_old_messages_enhanced()
+            cleanup_old_file_uploads()
             cleanup_stuck_tasks()
             await asyncio.sleep(3600)  # Run every hour
         except Exception as e:
@@ -527,6 +704,10 @@ class UserState:
         self.paused = False
         self.paused_at = None
         self.paused_progress = None
+        
+        # For duplicate file confirmation
+        self.duplicate_confirmation_pending = False
+        self.pending_duplicate_file: Optional[Dict] = None
         
     def pause(self):
         self.paused = True
@@ -750,7 +931,7 @@ def process_csv_file(file_bytes: bytes, operation: str) -> str:
 
 async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
                                     message: str, message_thread_id: Optional[int] = None, 
-                                    retries: int = 5, filename: Optional[str] = None,  # Increased retries
+                                    retries: int = 5, filename: Optional[str] = None,
                                     notification_type: str = 'content') -> bool:
     for attempt in range(retries):
         try:
@@ -765,9 +946,9 @@ async def send_telegram_message_safe(chat_id: int, context: ContextTypes.DEFAULT
                 parse_mode='Markdown'
             )
             
-            # Track message for admin preview system
+            # Track message for enhanced admin preview system
             if sent_message and sent_message.text:
-                track_message(chat_id, sent_message.message_id, sent_message.text)
+                track_message_enhanced(chat_id, sent_message.message_id, sent_message.text)
             
             if filename and sent_message:
                 if notification_type == 'content':
@@ -801,7 +982,7 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_sent += 1
                 
-                # Added: Delay between messages to prevent rate limiting
+                # Delay between messages to prevent rate limiting
                 if i < len(chunks):
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
@@ -853,7 +1034,7 @@ async def send_large_content_part(chat_id: int, context: ContextTypes.DEFAULT_TY
             if await send_telegram_message_safe(chat_id, context, chunk, message_thread_id, filename=filename):
                 total_messages_in_part += 1
                 
-                # Added: Delay between messages to prevent rate limiting
+                # Delay between messages to prevent rate limiting
                 if i < len(chunks):
                     await asyncio.sleep(MESSAGE_DELAY)
             else:
@@ -1006,6 +1187,10 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
                     file_message_thread_id
                 )
             
+            # Track file upload after successful processing
+            if success:
+                track_file_upload(chat_id, filename, file_info['size'])
+            
             # Always remove the file from queue after processing (success or failure)
             if state.queue and state.queue[0]['name'] == filename:
                 processed_file = state.queue.popleft()
@@ -1075,6 +1260,120 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
         state.paused = False
         state.paused_progress = None
         state.processing_start_time = None
+
+# ==================== DUPLICATE FILE HANDLING ====================
+async def ask_duplicate_confirmation(chat_id: int, message_thread_id: Optional[int], 
+                                     filename: str, file_size: int, duplicate_info: Dict[str, Any],
+                                     context: ContextTypes.DEFAULT_TYPE, state: UserState):
+    """Ask user for confirmation to post duplicate file"""
+    
+    time_ago = duplicate_info['hours_ago']
+    if time_ago < 1:
+        time_str = f"{int(time_ago * 60)} minutes ago"
+    else:
+        time_str = f"{time_ago:.1f} hours ago"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Post", callback_data=f"dup_yes_{filename}_{file_size}"),
+            InlineKeyboardButton("❌ No, Don't", callback_data=f"dup_no_{filename}_{file_size}")
+        ]
+    ]
+    
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=message_thread_id,
+        text=f"⚠️ **Duplicate File Detected**\n\n"
+             f"File `{filename}` was previously uploaded {time_str}.\n"
+             f"File size: {file_size:,} characters (same as before)\n\n"
+             f"Do you want to post it again?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    
+    # Store pending duplicate info
+    state.duplicate_confirmation_pending = True
+    state.pending_duplicate_file = {
+        'message_id': message.message_id,
+        'filename': filename,
+        'file_size': file_size,
+        'duplicate_info': duplicate_info
+    }
+
+async def handle_duplicate_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle duplicate file confirmation callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    message_thread_id = query.message.message_thread_id
+    
+    if not is_authorized(user_id, chat_id):
+        return
+    
+    state = await get_user_state_safe(chat_id)
+    
+    if not state.duplicate_confirmation_pending:
+        return
+    
+    callback_data = query.data
+    parts = callback_data.split('_')
+    
+    if len(parts) != 4:
+        return
+    
+    action = parts[1]  # 'yes' or 'no'
+    filename = parts[2]
+    file_size_str = parts[3]
+    
+    try:
+        file_size = int(file_size_str)
+    except ValueError:
+        return
+    
+    # Check if this matches our pending duplicate
+    if (not state.pending_duplicate_file or 
+        state.pending_duplicate_file['filename'] != filename or
+        state.pending_duplicate_file['file_size'] != file_size):
+        return
+    
+    # Delete the confirmation message
+    try:
+        await context.bot.delete_message(
+            chat_id=chat_id,
+            message_id=state.pending_duplicate_file['message_id']
+        )
+    except:
+        pass
+    
+    state.duplicate_confirmation_pending = False
+    pending_file = state.pending_duplicate_file.copy()
+    state.pending_duplicate_file = None
+    
+    if action == 'yes':
+        # User confirmed - process the file
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"✅ **Duplicate confirmed**\n\n"
+                 f"Processing `{filename}` as requested...",
+            parse_mode='Markdown'
+        )
+        
+        # Continue processing the file (this will be handled in handle_file function)
+        return True
+    else:
+        # User declined
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"❌ **Duplicate cancelled**\n\n"
+                 f"File `{filename}` was not posted.\n\n"
+                 f"You can upload a different file.",
+            parse_mode='Markdown'
+        )
+        return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
@@ -1153,6 +1452,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     chat_id = query.message.chat_id
     
+    # Check if this is a duplicate confirmation callback
+    if query.data.startswith('dup_'):
+        await handle_duplicate_confirmation(update, context)
+        return
+    
+    # Original button handler for operation selection
     if not is_authorized(user_id, chat_id):
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1221,6 +1526,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_lines.append(f"⏱ **Last send time:** {last_send_str}")
     
     status_lines.append(f"⏰ **Queue interval:** {QUEUE_INTERVAL // 60} minutes between files")
+    
+    if state.duplicate_confirmation_pending:
+        status_lines.append("⚠️ **Duplicate confirmation:** Pending")
     
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1817,6 +2125,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         content_size = len(content)
         
+        # Check for duplicate file within last 72 hours
+        duplicate_check = check_file_duplicate(chat_id, file_name, content_size)
+        
+        if duplicate_check['exists']:
+            # Ask for confirmation before proceeding
+            await ask_duplicate_confirmation(
+                chat_id, message_thread_id, file_name, content_size, 
+                duplicate_check, context, state
+            )
+            return
+        
         if content_size <= CONTENT_LIMIT_FOR_INTERVALS:
             chunks = split_into_telegram_chunks_without_cutting_words(content, TELEGRAM_MESSAGE_LIMIT)
             file_info = {
@@ -1927,7 +2246,8 @@ async def health_handler(request):
             "active_users": len(user_states),
             "allowed_ids_count": len(ALLOWED_IDS),
             "admin_ids_count": len(ADMIN_IDS),
-            "tracked_messages": len(message_tracking),
+            "tracked_messages": len(enhanced_message_tracking),
+            "file_upload_records": len(file_upload_tracking),
             "admin_preview_sessions": len(admin_preview_mode)
         }),
         content_type='application/json'
