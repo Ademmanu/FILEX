@@ -63,7 +63,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-file_history = defaultdict(list)
+# ==================== FIXED FILE HISTORY STORAGE ====================
+# Store ALL file entries, not just overwriting the last one
+file_history = defaultdict(list)  # chat_id -> list of all file entries
 file_message_mapping = {}
 file_notification_mapping = {}
 file_other_notifications = {}
@@ -550,31 +552,35 @@ async def periodic_cleanup_task():
             logger.error(f"Error in periodic cleanup task: {e}")
             await asyncio.sleep(300)
 
+# ==================== FIXED: UPDATE FILE HISTORY - NO OVERWRITING ====================
 def update_file_history(chat_id: int, filename: str, status: str, parts_count: int = 0, messages_count: int = 0):
-    """Update file history and also update file_upload_history with status"""
-    # Update local file_history
-    file_history[chat_id] = [entry for entry in file_history.get(chat_id, []) 
-                           if entry['filename'] != filename]
-    
+    """Update file history - DO NOT overwrite, append new entry with unique timestamp"""
     entry = {
         'filename': filename,
         'timestamp': datetime.now(UTC_PLUS_1),
         'status': status,
         'parts_count': parts_count,
-        'messages_count': messages_count
+        'messages_count': messages_count,
+        'unique_id': f"{filename}_{datetime.now(UTC_PLUS_1).timestamp()}"  # Unique identifier
     }
+    
+    # Add to history (do NOT remove previous entries)
     file_history[chat_id].append(entry)
     
+    # Keep only last 100 entries per chat
     if len(file_history[chat_id]) > 100:
         file_history[chat_id] = file_history[chat_id][-100:]
     
-    # Also update file_upload_history with status if we can find the file
+    # Also update file_upload_history with status
     for upload_entry in file_upload_history:
         if (upload_entry.filename == filename and 
             upload_entry.chat_id == chat_id and 
             upload_entry.is_recent()):
-            upload_entry.status = status
-            break
+            # Only update if timestamp is close (within 5 minutes)
+            time_diff = abs((upload_entry.timestamp - entry['timestamp']).total_seconds())
+            if time_diff < 300:  # 5 minutes
+                upload_entry.status = status
+                break
 
 def is_authorized(user_id: int, chat_id: int) -> bool:
     return user_id in ALLOWED_IDS or chat_id in ALLOWED_IDS
@@ -1034,6 +1040,7 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         logger.error(f"Error in send_with_intervals: {e}")
         return False
 
+# ==================== FIXED: COMPLETE FILE CLEANUP ====================
 async def cleanup_completed_file(filename: str, chat_id: int):
     """Clean up all tracking data for a completed file"""
     try:
@@ -1053,6 +1060,7 @@ async def cleanup_completed_file(filename: str, chat_id: int):
     except Exception as e:
         logger.error(f"Error cleaning up file {filename}: {e}")
 
+# ==================== FIXED: COMPLETE MESSAGE DELETION ====================
 async def delete_file_messages_completely(chat_id: int, filename: str, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Completely delete all messages related to a file, return number deleted"""
     deleted_count = 0
@@ -1069,7 +1077,9 @@ async def delete_file_messages_completely(chat_id: int, filename: str, context: 
                     deleted_count += 1
                     logger.info(f"Deleted content message {msg_id} for file {filename}")
                 except Exception as e:
-                    logger.error(f"Failed to delete content message {msg_id}: {e}")
+                    # If message already deleted, that's fine
+                    if "message to delete not found" not in str(e).lower():
+                        logger.error(f"Failed to delete content message {msg_id}: {e}")
         
         # Delete other notifications
         if filename in file_other_notifications:
@@ -1082,7 +1092,9 @@ async def delete_file_messages_completely(chat_id: int, filename: str, context: 
                     deleted_count += 1
                     logger.info(f"Deleted notification message {msg_id} for file {filename}")
                 except Exception as e:
-                    logger.error(f"Failed to delete notification message {msg_id}: {e}")
+                    # If message already deleted, that's fine
+                    if "message to delete not found" not in str(e).lower():
+                        logger.error(f"Failed to delete notification message {msg_id}: {e}")
         
         # Edit notification message if it exists
         if filename in file_notification_mapping:
@@ -1099,7 +1111,9 @@ async def delete_file_messages_completely(chat_id: int, filename: str, context: 
                 )
                 logger.info(f"Edited notification message for {filename}")
             except Exception as e:
-                logger.error(f"Failed to edit notification message: {e}")
+                # If message already deleted or can't be edited, that's fine
+                if "message to edit not found" not in str(e).lower():
+                    logger.error(f"Failed to edit notification message: {e}")
         
         # Clean up tracking data
         await cleanup_completed_file(filename, chat_id)
@@ -1882,6 +1896,7 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
     state.waiting_for_filename = True
     state.last_deleted_file = None
 
+# ==================== FIXED: SINGLE FILE DELETION WITH ACTUAL DELETION ====================
 async def handle_deletion_filename(chat_id: int, message_thread_id: Optional[int], filename: str, 
                                   context: ContextTypes.DEFAULT_TYPE, state: UserState):
     """Handle filename input for deletion - EXCLUDE already deleted files"""
@@ -1927,11 +1942,14 @@ async def handle_deletion_filename(chat_id: int, message_thread_id: Optional[int
         state.waiting_for_filename = False
         return
     
-    # If only one file found, delete it directly
+    # If only one file found, delete it directly - FIXED: ACTUALLY DELETE MESSAGES
     if len(matching_files) == 1:
         file_info = matching_files[0]
+        
+        # ACTUALLY DELETE THE MESSAGES
         deleted_count = await delete_file_messages_completely(chat_id, file_info['filename'], context)
         
+        # Update file history with "deleted" status
         update_file_history(chat_id, file_info['filename'], 'deleted')
         
         # Update file_upload_history status
@@ -1942,6 +1960,7 @@ async def handle_deletion_filename(chat_id: int, message_thread_id: Optional[int
                 upload_entry.status = 'deleted'
                 break
         
+        # Remove from queue if present
         state.remove_task_by_name(file_info['filename'])
         
         await context.bot.send_message(
