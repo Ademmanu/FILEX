@@ -14,7 +14,6 @@ from collections import deque, defaultdict
 from pathlib import Path
 import csv
 import io
-import hashlib
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -570,7 +569,7 @@ async def periodic_cleanup_task():
             await asyncio.sleep(300)
 
 def update_file_history(chat_id: int, filename: str, size: int, status: str, parts_count: int = 0, messages_count: int = 0):
-    """Update file history with instance tracking"""
+    """Update file history with instance tracking - OVERWRITES status for same file instance"""
     # Get or create file instance
     instance = get_file_instance(chat_id, filename, size)
     
@@ -959,10 +958,10 @@ async def send_chunks_immediately(chat_id: int, context: ContextTypes.DEFAULT_TY
             
             # Get file instance to update history with correct display name
             instance = get_file_instance_by_key(chat_id, storage_key)
-            display_name = instance.display_name if instance else filename
-            
-            update_file_history(chat_id, instance.base_name if instance else filename, 
-                              0, 'completed', messages_count=total_messages_sent)
+            if instance:
+                # Overwrite status for this file instance
+                update_file_history(chat_id, instance.base_name, instance.size, 
+                                  'completed', messages_count=total_messages_sent)
             return True
         else:
             logger.error(f"No chunks sent for `{filename}`")
@@ -1057,8 +1056,10 @@ async def send_with_intervals(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         # Get file instance to update history with correct display name
         instance = get_file_instance_by_key(chat_id, storage_key)
         
+        # Overwrite status for this file instance
         update_file_history(chat_id, instance.base_name if instance else filename, 
-                          0, 'completed', parts_count=total_parts, messages_count=total_messages_sent)
+                          instance.size if instance else 0, 'completed', 
+                          parts_count=total_parts, messages_count=total_messages_sent)
         
         return True
         
@@ -1110,9 +1111,11 @@ async def process_queue(chat_id: int, context: ContextTypes.DEFAULT_TYPE, messag
             file_message_thread_id = file_info.get('message_thread_id', message_thread_id)
             
             if file_info.get('requires_intervals', False):
+                # Overwrite status for this file instance
                 update_file_history(chat_id, file_info['base_name'], file_info['size'], 
                                   'running', parts_count=len(file_info['parts']))
             else:
+                # Overwrite status for this file instance
                 update_file_history(chat_id, file_info['base_name'], file_info['size'], 
                                   'running', messages_count=len(file_info['chunks']))
             
@@ -1641,6 +1644,7 @@ async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if state.queue:
         file_info = state.queue[0]
+        # Overwrite status for this file instance
         if file_info.get('requires_intervals', False):
             update_file_history(chat_id, file_info['base_name'], file_info['size'], 
                               'paused', parts_count=len(file_info['parts']))
@@ -1696,6 +1700,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if state.queue:
         file_info = state.queue[0]
+        # Overwrite status for this file instance
         if file_info.get('requires_intervals', False):
             update_file_history(chat_id, file_info['base_name'], file_info['size'], 
                               'running', parts_count=len(file_info['parts']))
@@ -1741,6 +1746,7 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_file = state.queue[0].get('display_name', 'Unknown') if state.queue else 'Unknown'
     storage_key = state.queue[0].get('storage_key', 'Unknown') if state.queue else 'Unknown'
     
+    # Overwrite status for this file instance
     update_file_history(chat_id, state.queue[0]['base_name'], state.queue[0]['size'], 'skipped')
     
     state.skip()
@@ -1788,6 +1794,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if state.queue:
         for file_info in state.queue:
+            # Overwrite status for each file instance
             if file_info.get('requires_intervals', False):
                 update_file_history(chat_id, file_info['base_name'], file_info['size'], 
                                   'cancelled', parts_count=len(file_info.get('parts', [])))
@@ -1907,11 +1914,12 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
             
             message_lines.append("Which file do you want to delete?")
             
-            # Create inline keyboard with buttons for each instance
+            # Create inline keyboard with buttons for each instance - UPDATED FORMAT
             keyboard = []
             row = []
             for i in range(len(instances)):
-                row.append(InlineKeyboardButton(f"(File {i+1})", callback_data=f"del_file_{i}"))
+                # Updated: 📄 File 1 format (no brackets, with emoji)
+                row.append(InlineKeyboardButton(f"📄 File {i+1}", callback_data=f"del_file_{i}"))
                 if len(row) == 2 or i == len(instances) - 1:
                     keyboard.append(row)
                     row = []
@@ -2013,7 +2021,7 @@ async def process_file_deletion_by_instance(chat_id: int, message_thread_id: Opt
         except Exception as e:
             logger.error(f"Failed to edit notification message: {e}")
     
-    # Update history
+    # Overwrite status for this file instance
     update_file_history(chat_id, instance.base_name, instance.size if history_entry else 0, 'deleted')
     
     # Remove from queue
@@ -2143,11 +2151,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             message_lines.append("Which file do you want to delete?")
             
-            # Create inline keyboard with buttons for each instance
+            # Create inline keyboard with buttons for each instance - UPDATED FORMAT
             keyboard = []
             row = []
             for i in range(len(instances)):
-                row.append(InlineKeyboardButton(f"(File {i+1})", callback_data=f"del_file_{i}"))
+                # Updated: 📄 File 1 format (no brackets, with emoji)
+                row.append(InlineKeyboardButton(f"📄 File {i+1}", callback_data=f"del_file_{i}"))
                 if len(row) == 2 or i == len(instances) - 1:
                     keyboard.append(row)
                     row = []
