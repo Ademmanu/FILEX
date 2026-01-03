@@ -1,5 +1,3 @@
-[file name]: bot.py
-[file content begin]
 #!/usr/bin/env python3
 """
 FileX Bot - Clean message headers, only part headers at beginning of each part
