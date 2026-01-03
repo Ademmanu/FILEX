@@ -363,14 +363,14 @@ def get_file_instance(chat_id: int, filename: str, size: int, is_duplicate: bool
         
         # If it's a duplicate, create new instance with higher number
         if is_duplicate:
-            # Find the next available instance number for duplicates
-            duplicate_instances = []
+            # Find all instances with same base name and size
+            all_instances = []
             for key, instance in file_instances[chat_id].items():
-                if instance.base_name == filename and instance.size == size and instance.is_duplicate:
-                    duplicate_instances.append(instance)
+                if instance.base_name == filename and instance.size == size:
+                    all_instances.append(instance)
             
-            if duplicate_instances:
-                max_instance = max(instance.instance_num for instance in duplicate_instances)
+            if all_instances:
+                max_instance = max(instance.instance_num for instance in all_instances)
                 new_instance_num = max_instance + 1
             else:
                 new_instance_num = 1
@@ -395,12 +395,23 @@ def find_file_instances(chat_id: int, filename: str) -> List[FileInstance]:
     instances = []
     for instance in file_instances[chat_id].values():
         if instance.base_name == filename:
-            # Check if this instance still has messages or notifications
-            has_content = (instance.storage_key in file_message_mapping and file_message_mapping[instance.storage_key]) or \
-                         (instance.storage_key in file_notification_mapping) or \
-                         (instance.storage_key in file_other_notifications and file_other_notifications[instance.storage_key])
+            # Check if this instance still has content or is in queue/running
+            has_content = False
             
-            # Only include if it has content or is in history with non-deleted status
+            # Check if in queue or currently processing
+            state = get_user_state(chat_id)
+            for file_info in state.queue:
+                if file_info.get('storage_key') == instance.storage_key:
+                    has_content = True
+                    break
+            
+            # Check if has messages or notifications
+            if not has_content:
+                has_content = (instance.storage_key in file_message_mapping and file_message_mapping[instance.storage_key]) or \
+                             (instance.storage_key in file_notification_mapping) or \
+                             (instance.storage_key in file_other_notifications and file_other_notifications[instance.storage_key])
+            
+            # Check history for non-deleted status
             history_entry = None
             for entry in file_history.get(chat_id, []):
                 if entry.get('storage_key') == instance.storage_key and entry.get('status') != 'deleted':
@@ -594,9 +605,9 @@ def update_file_history(chat_id: int, filename: str, size: int, status: str, par
     # Get file instance
     instance = get_file_instance(chat_id, filename, size)
     
-    # Remove any existing entry for this exact filename + size
+    # Remove any existing entry for this exact filename + size + instance
     file_history[chat_id] = [entry for entry in file_history.get(chat_id, []) 
-                           if not (entry.get('base_name') == filename and entry.get('size') == size)]
+                           if not (entry.get('storage_key') == instance.storage_key)]
     
     entry = {
         'filename': instance.display_name,
@@ -679,6 +690,7 @@ class UserState:
         # For deletion file selection
         self.waiting_for_deletion_selection = False
         self.pending_deletion_instances = []
+        self.deletion_message_id = None  # Store message ID for inline button message
         
     def pause(self):
         self.paused = True
@@ -1421,12 +1433,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state.waiting_for_filename = False
             state.last_deleted_file = None
             
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text="❌ **Operation cancelled**",
-                parse_mode='Markdown'
-            )
+            # Edit the message to show cancellation
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=state.deletion_message_id,
+                    text="❌ **Operation cancelled**",
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                logger.error(f"Failed to edit deletion message: {e}")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    text="❌ **Operation cancelled**",
+                    parse_mode='Markdown'
+                )
+            
+            state.deletion_message_id = None
             return
         
         # Handle file instance selection
@@ -1435,13 +1459,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if 0 <= instance_index < len(state.pending_deletion_instances):
                 instance = state.pending_deletion_instances[instance_index]
                 
-                # Process the deletion
-                await process_file_deletion_by_instance(chat_id, message_thread_id, instance, context, state)
+                # Process the deletion and edit the message
+                await process_file_deletion_by_instance_with_edit(chat_id, message_thread_id, instance, context, state, query.message.message_id)
                 
                 state.waiting_for_deletion_selection = False
                 state.pending_deletion_instances = []
                 state.waiting_for_filename = False
                 state.last_deleted_file = None
+                state.deletion_message_id = None
         return
     
     # Handle deletion flow cancel
@@ -1518,6 +1543,31 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if entry['timestamp'] >= twelve_hours_ago
     ]
     
+    # Add queued files that haven't been processed yet
+    state = get_user_state(chat_id)
+    for file_info in state.queue:
+        # Check if this file is already in recent_files
+        already_in_history = any(
+            entry.get('storage_key') == file_info.get('storage_key')
+            for entry in recent_files
+        )
+        
+        if not already_in_history:
+            instance = get_file_instance_by_key(chat_id, file_info.get('storage_key', ''))
+            if instance:
+                entry = {
+                    'filename': instance.display_name,
+                    'storage_key': instance.storage_key,
+                    'base_name': instance.base_name,
+                    'size': file_info.get('size', 0),
+                    'instance_num': instance.instance_num,
+                    'timestamp': datetime.now(UTC_PLUS_1),
+                    'status': 'queued',
+                    'parts_count': len(file_info.get('parts', [])) if file_info.get('requires_intervals', False) else 0,
+                    'messages_count': len(file_info.get('chunks', [])) if not file_info.get('requires_intervals', False) else 0
+                }
+                recent_files.append(entry)
+    
     if not recent_files:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1541,13 +1591,14 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'cancelled': '🚫',
             'running': '📤',
             'paused': '⏸️',
-            'timeout_cancelled': '⏱️'
+            'timeout_cancelled': '⏱️',
+            'queued': '⏳'
         }.get(entry['status'], '📝')
         
         size_info = f"{entry['size']:,} characters"
         
         count_info = ""
-        if entry['status'] == 'completed':
+        if entry['status'] in ['completed', 'running', 'queued']:
             if entry.get('parts_count', 0) > 0:
                 count_info = f" ({entry['parts_count']} part{'s' if entry['parts_count'] > 1 else ''}"
                 if entry.get('messages_count', 0) > 0:
@@ -1858,7 +1909,63 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
         
         if len(instances) == 1:
             # Single instance - delete directly
-            await process_file_deletion_by_instance(chat_id, message_thread_id, instances[0], context, state)
+            instance = instances[0]
+            # Find history entry for this instance
+            history_entry = None
+            for entry in file_history.get(chat_id, []):
+                if entry.get('storage_key') == instance.storage_key:
+                    history_entry = entry
+                    break
+            
+            message_lines = []
+            message_lines.append(f"🗑️ **Delete File Content**\n\n")
+            
+            if history_entry:
+                size_info = f"{history_entry['size']:,} characters"
+                count_info = ""
+                if history_entry.get('parts_count', 0) > 0:
+                    count_info = f" ({history_entry['parts_count']} parts)"
+                elif history_entry.get('messages_count', 0) > 0:
+                    count_info = f" ({history_entry['messages_count']} messages)"
+                
+                status_emoji = {
+                    'completed': '✅',
+                    'running': '📤',
+                    'paused': '⏸️',
+                    'cancelled': '🚫',
+                    'skipped': '⏭️',
+                    'deleted': '🗑️',
+                    'queued': '⏳'
+                }.get(history_entry['status'], '📝')
+                
+                message_lines.append(f"Found 1 file with name `{filename}`:\n")
+                message_lines.append(f"📄 `{instance.display_name}` {size_info}{count_info}")
+                message_lines.append(f"{status_emoji} Status: {history_entry['status'].capitalize()}")
+            else:
+                message_lines.append(f"Found 1 file with name `{filename}`:\n")
+                message_lines.append(f"📄 `{instance.display_name}`")
+            
+            message_lines.append("")
+            message_lines.append("Do you want to delete this file?")
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Yes, Delete", callback_data=f"del_file_0"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")
+                ]
+            ]
+            
+            sent_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text="\n".join(message_lines),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            
+            state.waiting_for_deletion_selection = True
+            state.pending_deletion_instances = instances
+            state.deletion_message_id = sent_msg.message_id
         else:
             # Multiple instances - show selection
             state.waiting_for_deletion_selection = True
@@ -1892,14 +1999,34 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
                         'paused': '⏸️',
                         'cancelled': '🚫',
                         'skipped': '⏭️',
-                        'deleted': '🗑️'
+                        'deleted': '🗑️',
+                        'queued': '⏳'
                     }.get(history_entry['status'], '📝')
                     
                     message_lines.append(f"{i}. 📄 `{instance.display_name}` {size_info}{count_info}")
                     message_lines.append(f"   {status_emoji} Status: {history_entry['status'].capitalize()} ({time_str})")
                 else:
-                    # Skip instances without history (shouldn't happen)
-                    continue
+                    # This should show files in queue that haven't been processed yet
+                    # Check if file is in queue
+                    in_queue = False
+                    state_temp = get_user_state(chat_id)
+                    for file_info in state_temp.queue:
+                        if file_info.get('storage_key') == instance.storage_key:
+                            in_queue = True
+                            size_info = f"{file_info.get('size', 0):,} characters"
+                            count_info = ""
+                            if file_info.get('requires_intervals', False):
+                                count_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
+                            else:
+                                count_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
+                            
+                            message_lines.append(f"{i}. 📄 `{instance.display_name}` {size_info}{count_info}")
+                            message_lines.append(f"   ⏳ Status: Queued")
+                            break
+                    
+                    if not in_queue:
+                        message_lines.append(f"{i}. 📄 `{instance.display_name}`")
+                        message_lines.append(f"   📝 Status: Unknown")
                 
                 message_lines.append("")
             
@@ -1912,13 +2039,15 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
             
             keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")])
             
-            await context.bot.send_message(
+            sent_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
                 text="\n".join(message_lines),
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
+            
+            state.deletion_message_id = sent_msg.message_id
         
         return
     
@@ -1938,117 +2067,257 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode='Markdown'
     )
 
-async def process_file_deletion_by_instance(chat_id: int, message_thread_id: Optional[int], 
+async def process_file_deletion_by_instance_with_edit(chat_id: int, message_thread_id: Optional[int], 
                                            instance: FileInstance, context: ContextTypes.DEFAULT_TYPE, 
-                                           state: UserState):
-    """Process file deletion for a specific instance"""
+                                           state: UserState, message_id: int):
+    """Process file deletion for a specific instance and edit the message"""
     
-    # Find history entry
-    history_entry = None
-    for entry in file_history.get(chat_id, []):
-        if entry.get('storage_key') == instance.storage_key:
-            history_entry = entry
-            break
-    
-    is_currently_processing = False
-    if state.queue and state.queue[0].get('storage_key') == instance.storage_key and state.processing:
-        is_currently_processing = True
-        state.cancel_current_task()
-        if state.queue:
-            state.queue.popleft()
-    
-    messages_to_delete = 0
-    deleted_messages = []
-    
-    # Delete content messages
-    if instance.storage_key in file_message_mapping:
-        messages_to_delete += len(file_message_mapping[instance.storage_key])
-        for msg_id in file_message_mapping[instance.storage_key]:
+    try:
+        # Find history entry
+        history_entry = None
+        for entry in file_history.get(chat_id, []):
+            if entry.get('storage_key') == instance.storage_key:
+                history_entry = entry
+                break
+        
+        is_currently_processing = False
+        if state.queue and state.queue[0].get('storage_key') == instance.storage_key and state.processing:
+            is_currently_processing = True
+            state.cancel_current_task()
+            if state.queue:
+                state.queue.popleft()
+        
+        messages_to_delete = 0
+        deleted_messages = []
+        
+        # Delete content messages
+        if instance.storage_key in file_message_mapping:
+            messages_to_delete += len(file_message_mapping[instance.storage_key])
+            for msg_id in file_message_mapping[instance.storage_key]:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=msg_id
+                    )
+                    deleted_messages.append(msg_id)
+                    logger.info(f"Deleted content message {msg_id} for file {instance.display_name}")
+                except Exception as e:
+                    logger.error(f"Failed to delete content message {msg_id}: {e}")
+        
+        # Delete other notifications
+        if instance.storage_key in file_other_notifications:
+            messages_to_delete += len(file_other_notifications[instance.storage_key])
+            for msg_id in file_other_notifications[instance.storage_key]:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=msg_id
+                    )
+                    deleted_messages.append(msg_id)
+                    logger.info(f"Deleted other notification message {msg_id} for file {instance.display_name}")
+                except Exception as e:
+                    logger.error(f"Failed to delete other notification message {msg_id}: {e}")
+        
+        # Edit acceptance/queue notification (don't delete it)
+        notification_edited = False
+        if instance.storage_key in file_notification_mapping:
+            notification_msg_id = file_notification_mapping[instance.storage_key]
             try:
-                await context.bot.delete_message(
+                await context.bot.edit_message_text(
                     chat_id=chat_id,
-                    message_id=msg_id
+                    message_id=notification_msg_id,
+                    text=f"🗑️ **File Content Deleted**\n\n"
+                         f"File: `{instance.display_name}`\n"
+                         f"Messages deleted: {messages_to_delete}\n"
+                         f"All content from this file has been removed.",
+                    parse_mode='Markdown'
                 )
-                deleted_messages.append(msg_id)
-                logger.info(f"Deleted content message {msg_id} for file {instance.display_name}")
+                notification_edited = True
+                logger.info(f"Edited acceptance/queued notification for {instance.display_name}")
             except Exception as e:
-                logger.error(f"Failed to delete content message {msg_id}: {e}")
-    
-    # Delete other notifications
-    if instance.storage_key in file_other_notifications:
-        messages_to_delete += len(file_other_notifications[instance.storage_key])
-        for msg_id in file_other_notifications[instance.storage_key]:
-            try:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=msg_id
-                )
-                deleted_messages.append(msg_id)
-                logger.info(f"Deleted other notification message {msg_id} for file {instance.display_name}")
-            except Exception as e:
-                logger.error(f"Failed to delete other notification message {msg_id}: {e}")
-    
-    # Edit acceptance/queue notification (don't delete it)
-    notification_edited = False
-    if instance.storage_key in file_notification_mapping:
-        notification_msg_id = file_notification_mapping[instance.storage_key]
+                logger.error(f"Failed to edit notification message: {e}")
+        
+        # Update history to deleted status
+        update_file_history(chat_id, instance.base_name, instance.size if history_entry else 0, 'deleted')
+        
+        # Remove from queue
+        state.remove_task_by_storage_key(instance.storage_key)
+        
+        # Clean up tracking
+        await cleanup_completed_file(instance.storage_key, chat_id)
+        
+        # Delete the notification mapping
+        if instance.storage_key in file_notification_mapping:
+            del file_notification_mapping[instance.storage_key]
+        
+        # Delete the instance
+        delete_file_instance(chat_id, instance.storage_key)
+        
+        # Edit the original message to show success
+        result_text = f"🗑️ `{instance.display_name}` content deleted\nMessages removed: {len(deleted_messages)}"
+        
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=result_text,
+            parse_mode='Markdown'
+        )
+        
+        state.waiting_for_filename = False
+        
+        if is_currently_processing and state.queue and not state.processing:
+            next_file = state.queue[0].get('display_name', 'Unknown')
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"🔄 **Moving to next task**\n\n"
+                     f"Starting next task: `{next_file}`",
+                parse_mode='Markdown'
+            )
+            state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
+        elif is_currently_processing and not state.queue:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text="🏁 **Processing stopped**\n\n"
+                     "No more tasks in queue.",
+                parse_mode='Markdown'
+            )
+            
+    except Exception as e:
+        logger.error(f"Error in process_file_deletion_by_instance_with_edit: {e}")
+        # Edit the message to show error
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
-                message_id=notification_msg_id,
-                text=f"🗑️ **File Content Deleted**\n\n"
-                     f"File: `{instance.display_name}`\n"
-                     f"Messages deleted: {messages_to_delete}\n"
-                     f"All content from this file has been removed.",
+                message_id=message_id,
+                text=f"❌ **Error deleting file**\n\nFailed to delete `{instance.display_name}`. Please try again.",
                 parse_mode='Markdown'
             )
-            notification_edited = True
-            logger.info(f"Edited acceptance/queued notification for {instance.display_name}")
-        except Exception as e:
-            logger.error(f"Failed to edit notification message: {e}")
+        except Exception as edit_error:
+            logger.error(f"Failed to edit error message: {edit_error}")
+
+async def process_file_deletion_by_instance(chat_id: int, message_thread_id: Optional[int], 
+                                           instance: FileInstance, context: ContextTypes.DEFAULT_TYPE, 
+                                           state: UserState):
+    """Process file deletion for a specific instance (for single file case)"""
     
-    # Update history to deleted status
-    update_file_history(chat_id, instance.base_name, instance.size if history_entry else 0, 'deleted')
-    
-    # Remove from queue
-    state.remove_task_by_storage_key(instance.storage_key)
-    
-    # Clean up tracking
-    await cleanup_completed_file(instance.storage_key, chat_id)
-    
-    # Delete the notification mapping
-    if instance.storage_key in file_notification_mapping:
-        del file_notification_mapping[instance.storage_key]
-    
-    # Delete the instance
-    delete_file_instance(chat_id, instance.storage_key)
-    
-    await context.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=message_thread_id,
-        text=f"🗑️ `{instance.display_name}` content deleted\n"
-             f"Messages removed: {len(deleted_messages)}",
-        parse_mode='Markdown'
-    )
-    
-    state.waiting_for_filename = False
-    
-    if is_currently_processing and state.queue and not state.processing:
-        next_file = state.queue[0].get('display_name', 'Unknown')
+    try:
+        # Find history entry
+        history_entry = None
+        for entry in file_history.get(chat_id, []):
+            if entry.get('storage_key') == instance.storage_key:
+                history_entry = entry
+                break
+        
+        is_currently_processing = False
+        if state.queue and state.queue[0].get('storage_key') == instance.storage_key and state.processing:
+            is_currently_processing = True
+            state.cancel_current_task()
+            if state.queue:
+                state.queue.popleft()
+        
+        messages_to_delete = 0
+        deleted_messages = []
+        
+        # Delete content messages
+        if instance.storage_key in file_message_mapping:
+            messages_to_delete += len(file_message_mapping[instance.storage_key])
+            for msg_id in file_message_mapping[instance.storage_key]:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=msg_id
+                    )
+                    deleted_messages.append(msg_id)
+                    logger.info(f"Deleted content message {msg_id} for file {instance.display_name}")
+                except Exception as e:
+                    logger.error(f"Failed to delete content message {msg_id}: {e}")
+        
+        # Delete other notifications
+        if instance.storage_key in file_other_notifications:
+            messages_to_delete += len(file_other_notifications[instance.storage_key])
+            for msg_id in file_other_notifications[instance.storage_key]:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=msg_id
+                    )
+                    deleted_messages.append(msg_id)
+                    logger.info(f"Deleted other notification message {msg_id} for file {instance.display_name}")
+                except Exception as e:
+                    logger.error(f"Failed to delete other notification message {msg_id}: {e}")
+        
+        # Edit acceptance/queue notification (don't delete it)
+        notification_edited = False
+        if instance.storage_key in file_notification_mapping:
+            notification_msg_id = file_notification_mapping[instance.storage_key]
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=notification_msg_id,
+                    text=f"🗑️ **File Content Deleted**\n\n"
+                         f"File: `{instance.display_name}`\n"
+                         f"Messages deleted: {messages_to_delete}\n"
+                         f"All content from this file has been removed.",
+                    parse_mode='Markdown'
+                )
+                notification_edited = True
+                logger.info(f"Edited acceptance/queued notification for {instance.display_name}")
+            except Exception as e:
+                logger.error(f"Failed to edit notification message: {e}")
+        
+        # Update history to deleted status
+        update_file_history(chat_id, instance.base_name, instance.size if history_entry else 0, 'deleted')
+        
+        # Remove from queue
+        state.remove_task_by_storage_key(instance.storage_key)
+        
+        # Clean up tracking
+        await cleanup_completed_file(instance.storage_key, chat_id)
+        
+        # Delete the notification mapping
+        if instance.storage_key in file_notification_mapping:
+            del file_notification_mapping[instance.storage_key]
+        
+        # Delete the instance
+        delete_file_instance(chat_id, instance.storage_key)
+        
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
-            text=f"🔄 **Moving to next task**\n\n"
-                 f"Starting next task: `{next_file}`",
+            text=f"🗑️ `{instance.display_name}` content deleted\n"
+                 f"Messages removed: {len(deleted_messages)}",
             parse_mode='Markdown'
         )
-        state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
-    elif is_currently_processing and not state.queue:
+        
+        state.waiting_for_filename = False
+        
+        if is_currently_processing and state.queue and not state.processing:
+            next_file = state.queue[0].get('display_name', 'Unknown')
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"🔄 **Moving to next task**\n\n"
+                     f"Starting next task: `{next_file}`",
+                parse_mode='Markdown'
+            )
+            state.processing_task = asyncio.create_task(process_queue(chat_id, context, message_thread_id))
+        elif is_currently_processing and not state.queue:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text="🏁 **Processing stopped**\n\n"
+                     "No more tasks in queue.",
+                parse_mode='Markdown'
+            )
+            
+    except Exception as e:
+        logger.error(f"Error in process_file_deletion_by_instance: {e}")
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
-            text="🏁 **Processing stopped**\n\n"
-                 "No more tasks in queue.",
+            text=f"❌ **Error deleting file**\n\nFailed to delete `{instance.display_name}`. Please try again.",
             parse_mode='Markdown'
         )
 
@@ -2093,8 +2362,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         if len(instances) == 1:
-            # Single instance - delete directly
-            await process_file_deletion_by_instance(chat_id, message_thread_id, instances[0], context, state)
+            # Single instance - show confirmation with inline buttons
+            instance = instances[0]
+            # Find history entry for this instance
+            history_entry = None
+            for entry in file_history.get(chat_id, []):
+                if entry.get('storage_key') == instance.storage_key:
+                    history_entry = entry
+                    break
+            
+            message_lines = []
+            message_lines.append(f"🗑️ **Delete File Content**\n\n")
+            
+            if history_entry:
+                size_info = f"{history_entry['size']:,} characters"
+                count_info = ""
+                if history_entry.get('parts_count', 0) > 0:
+                    count_info = f" ({history_entry['parts_count']} parts)"
+                elif history_entry.get('messages_count', 0) > 0:
+                    count_info = f" ({history_entry['messages_count']} messages)"
+                
+                status_emoji = {
+                    'completed': '✅',
+                    'running': '📤',
+                    'paused': '⏸️',
+                    'cancelled': '🚫',
+                    'skipped': '⏭️',
+                    'deleted': '🗑️',
+                    'queued': '⏳'
+                }.get(history_entry['status'], '📝')
+                
+                message_lines.append(f"Found 1 file with name `{filename}`:\n")
+                message_lines.append(f"📄 `{instance.display_name}` {size_info}{count_info}")
+                message_lines.append(f"{status_emoji} Status: {history_entry['status'].capitalize()}")
+            else:
+                message_lines.append(f"Found 1 file with name `{filename}`:\n")
+                message_lines.append(f"📄 `{instance.display_name}`")
+            
+            message_lines.append("")
+            message_lines.append("Do you want to delete this file?")
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Yes, Delete", callback_data=f"del_file_0"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")
+                ]
+            ]
+            
+            sent_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text="\n".join(message_lines),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            
+            state.waiting_for_deletion_selection = True
+            state.pending_deletion_instances = instances
+            state.deletion_message_id = sent_msg.message_id
         else:
             # Multiple instances - show selection
             state.waiting_for_deletion_selection = True
@@ -2128,14 +2453,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         'paused': '⏸️',
                         'cancelled': '🚫',
                         'skipped': '⏭️',
-                        'deleted': '🗑️'
+                        'deleted': '🗑️',
+                        'queued': '⏳'
                     }.get(history_entry['status'], '📝')
                     
                     message_lines.append(f"{i}. 📄 `{instance.display_name}` {size_info}{count_info}")
                     message_lines.append(f"   {status_emoji} Status: {history_entry['status'].capitalize()} ({time_str})")
                 else:
-                    # Skip instances without history
-                    continue
+                    # This should show files in queue that haven't been processed yet
+                    # Check if file is in queue
+                    in_queue = False
+                    state_temp = get_user_state(chat_id)
+                    for file_info in state_temp.queue:
+                        if file_info.get('storage_key') == instance.storage_key:
+                            in_queue = True
+                            size_info = f"{file_info.get('size', 0):,} characters"
+                            count_info = ""
+                            if file_info.get('requires_intervals', False):
+                                count_info = f" ({len(file_info['parts'])} parts)" if len(file_info['parts']) > 1 else ""
+                            else:
+                                count_info = f" ({len(file_info['chunks'])} messages)" if len(file_info['chunks']) > 1 else ""
+                            
+                            message_lines.append(f"{i}. 📄 `{instance.display_name}` {size_info}{count_info}")
+                            message_lines.append(f"   ⏳ Status: Queued")
+                            break
+                    
+                    if not in_queue:
+                        message_lines.append(f"{i}. 📄 `{instance.display_name}`")
+                        message_lines.append(f"   📝 Status: Unknown")
                 
                 message_lines.append("")
             
@@ -2148,13 +2493,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")])
             
-            await context.bot.send_message(
+            sent_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
                 text="\n".join(message_lines),
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
+            
+            state.deletion_message_id = sent_msg.message_id
         
         return
     
@@ -2176,6 +2523,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.last_deleted_file = None
     state.waiting_for_deletion_selection = False
     state.pending_deletion_instances = []
+    state.deletion_message_id = None
     
     state.cancel_requested = False
     
