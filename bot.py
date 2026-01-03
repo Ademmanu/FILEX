@@ -104,18 +104,19 @@ admin_preview_mode: Set[int] = set()
 # ==================== DUPLICATE FILE TRACKING ====================
 class FileHistoryEntry:
     """Track file upload history for duplicate detection"""
-    def __init__(self, filename: str, size: int, chat_id: int, timestamp: datetime):
+    def __init__(self, filename: str, size: int, chat_id: int, timestamp: datetime, status: str = "uploaded"):
         self.filename = filename
         self.size = size
         self.chat_id = chat_id
         self.timestamp = timestamp
+        self.status = status  # completed, cancelled, deleted, etc.
     
     def is_recent(self) -> bool:
         """Check if file was uploaded within last 72 hours"""
         return datetime.now(UTC_PLUS_1) - self.timestamp <= timedelta(hours=72)
     
     def __repr__(self):
-        return f"FileHistoryEntry({self.filename}, {self.size} bytes, {self.timestamp.strftime('%Y-%m-%d %H:%M:%S')})"
+        return f"FileHistoryEntry({self.filename}, {self.size} bytes, {self.timestamp.strftime('%Y-%m-%d %H:%M:%S')}, status={self.status})"
 
 file_upload_history: List[FileHistoryEntry] = []
 
@@ -214,15 +215,28 @@ def check_duplicate_file(filename: str, size: int, chat_id: int) -> Optional[Fil
     
     return None
 
-def add_file_to_history(filename: str, size: int, chat_id: int):
+def add_file_to_history(filename: str, size: int, chat_id: int, status: str = "uploaded"):
     """Add file to upload history for duplicate detection"""
     entry = FileHistoryEntry(
         filename=filename,
         size=size,
         chat_id=chat_id,
-        timestamp=datetime.now(UTC_PLUS_1)
+        timestamp=datetime.now(UTC_PLUS_1),
+        status=status
     )
     file_upload_history.append(entry)
+
+def get_file_status_from_history(chat_id: int, filename: str, size: int) -> Optional[str]:
+    """Get the status of a file from history"""
+    cleanup_old_messages_and_files()
+    
+    for entry in file_upload_history:
+        if (entry.filename == filename and 
+            entry.size == size and 
+            entry.chat_id == chat_id):
+            return entry.status
+    
+    return None
 
 # ==================== ENHANCED PREVIEW MATCHING FUNCTIONS ====================
 def extract_preview_sections(text: str) -> List[str]:
@@ -537,6 +551,8 @@ async def periodic_cleanup_task():
             await asyncio.sleep(300)
 
 def update_file_history(chat_id: int, filename: str, status: str, parts_count: int = 0, messages_count: int = 0):
+    """Update file history and also update file_upload_history with status"""
+    # Update local file_history
     file_history[chat_id] = [entry for entry in file_history.get(chat_id, []) 
                            if entry['filename'] != filename]
     
@@ -551,6 +567,14 @@ def update_file_history(chat_id: int, filename: str, status: str, parts_count: i
     
     if len(file_history[chat_id]) > 100:
         file_history[chat_id] = file_history[chat_id][-100:]
+    
+    # Also update file_upload_history with status if we can find the file
+    for upload_entry in file_upload_history:
+        if (upload_entry.filename == filename and 
+            upload_entry.chat_id == chat_id and 
+            upload_entry.is_recent()):
+            upload_entry.status = status
+            break
 
 def is_authorized(user_id: int, chat_id: int) -> bool:
     return user_id in ALLOWED_IDS or chat_id in ALLOWED_IDS
@@ -1324,8 +1348,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_info = state.pending_duplicate_file
                 state.pending_duplicate_file = None
                 
-                # Add to file history
-                add_file_to_history(file_info['name'], file_info['size'], chat_id)
+                # Add to file history with "uploaded" status
+                add_file_to_history(file_info['name'], file_info['size'], chat_id, "uploaded")
                 
                 # Add to queue
                 queue_size = await add_to_queue_safe(state, file_info)
@@ -1400,8 +1424,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context
                 )
                 
-                # Update file history
+                # Update file history with "deleted" status
                 update_file_history(chat_id, selected_file['filename'], 'deleted')
+                
+                # Update file_upload_history status
+                for upload_entry in file_upload_history:
+                    if (upload_entry.filename == selected_file['filename'] and 
+                        upload_entry.chat_id == chat_id and 
+                        abs((upload_entry.timestamp - selected_file['timestamp']).total_seconds()) < 60):
+                        upload_entry.status = 'deleted'
+                        break
                 
                 # Remove from queue if present
                 state.remove_task_by_name(selected_file['filename'])
@@ -1852,27 +1884,46 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_deletion_filename(chat_id: int, message_thread_id: Optional[int], filename: str, 
                                   context: ContextTypes.DEFAULT_TYPE, state: UserState):
-    """Handle filename input for deletion"""
+    """Handle filename input for deletion - EXCLUDE already deleted files"""
     
-    # Find all files with this name in history
+    # Find all files with this name in history EXCEPT deleted ones
     matching_files = []
     for entry in file_history.get(chat_id, []):
-        if entry['filename'] == filename:
+        if entry['filename'] == filename and entry['status'] != 'deleted':
             matching_files.append({
                 'filename': entry['filename'],
                 'timestamp': entry['timestamp'],
-                'status': entry['status']
+                'status': entry['status'],
+                'parts_count': entry.get('parts_count', 0),
+                'messages_count': entry.get('messages_count', 0)
             })
     
     if not matching_files:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text=f"❌ **File not found**\n\n"
-                 f"No record found for `{filename}` in your history.\n\n"
-                 f"Use /delfilecontent to try again with a different filename.",
-            parse_mode='Markdown'
+        # Also check if file exists but is marked as deleted
+        deleted_exists = any(
+            entry['filename'] == filename and entry['status'] == 'deleted'
+            for entry in file_history.get(chat_id, [])
         )
+        
+        if deleted_exists:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"🗑️ **File Already Deleted**\n\n"
+                     f"File `{filename}` was already deleted previously.\n"
+                     f"Use /delfilecontent to delete a different file.",
+                parse_mode='Markdown'
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=f"❌ **File not found**\n\n"
+                     f"No record found for `{filename}` in your history.\n\n"
+                     f"Use /delfilecontent to try again with a different filename.",
+                parse_mode='Markdown'
+            )
+        
         state.waiting_for_filename = False
         return
     
@@ -1882,6 +1933,15 @@ async def handle_deletion_filename(chat_id: int, message_thread_id: Optional[int
         deleted_count = await delete_file_messages_completely(chat_id, file_info['filename'], context)
         
         update_file_history(chat_id, file_info['filename'], 'deleted')
+        
+        # Update file_upload_history status
+        for upload_entry in file_upload_history:
+            if (upload_entry.filename == file_info['filename'] and 
+                upload_entry.chat_id == chat_id and 
+                abs((upload_entry.timestamp - file_info['timestamp']).total_seconds()) < 60):
+                upload_entry.status = 'deleted'
+                break
+        
         state.remove_task_by_name(file_info['filename'])
         
         await context.bot.send_message(
@@ -1922,22 +1982,45 @@ async def handle_deletion_filename(chat_id: int, message_thread_id: Optional[int
     keyboard = []
     for i, file_info in enumerate(matching_files):
         time_str = file_info['timestamp'].strftime('%H:%M:%S')
+        
+        # Add status and message count info
+        status_info = file_info['status'].capitalize()
+        count_info = ""
+        if file_info['status'] == 'completed':
+            if file_info.get('parts_count', 0) > 0:
+                count_info = f" ({file_info['parts_count']} part{'s' if file_info['parts_count'] > 1 else ''}"
+                if file_info.get('messages_count', 0) > 0:
+                    count_info += f", {file_info['messages_count']} messages"
+                count_info += ")"
+            elif file_info.get('messages_count', 0) > 0:
+                count_info = f" ({file_info['messages_count']} message{'s' if file_info['messages_count'] > 1 else ''})"
+        
+        button_text = f"File {i+1}: {time_str} ({status_info}{count_info})"
         keyboard.append([
-            InlineKeyboardButton(
-                f"File {i+1} ({time_str})", 
-                callback_data=f"del_file_{i}"
-            )
+            InlineKeyboardButton(button_text, callback_data=f"del_file_{i}")
         ])
     
     keyboard.append([InlineKeyboardButton("🚫 Cancel", callback_data="del_cancel")])
     
     # Format message
     message = f"📋 **Multiple Files Found**\n\n"
-    message += f"Found {len(matching_files)} files named `{filename}`:\n\n"
+    message += f"Found {len(matching_files)} active files named `{filename}`:\n\n"
     
     for i, file_info in enumerate(matching_files):
         time_str = file_info['timestamp'].strftime('%H:%M:%S')
-        message += f"{i+1}. {file_info['filename']} - {time_str} ({file_info['status']})\n"
+        status_info = file_info['status'].capitalize()
+        count_info = ""
+        
+        if file_info['status'] == 'completed':
+            if file_info.get('parts_count', 0) > 0:
+                count_info = f" ({file_info['parts_count']} part{'s' if file_info['parts_count'] > 1 else ''}"
+                if file_info.get('messages_count', 0) > 0:
+                    count_info += f", {file_info['messages_count']} messages"
+                count_info += ")"
+            elif file_info.get('messages_count', 0) > 0:
+                count_info = f" ({file_info['messages_count']} message{'s' if file_info['messages_count'] > 1 else ''})"
+        
+        message += f"{i+1}. {file_info['filename']} - {time_str} ({status_info}{count_info})\n"
     
     message += "\nWhich file do you want to delete?"
     
@@ -1967,7 +2050,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_thread_id = update.effective_message.message_thread_id
         filename = update.message.text.strip()
         
-        # Handle cancel text
+        # Handle cancel text (backward compatibility)
         if filename.lower() == 'cancel':
             state.waiting_for_filename = False
             await context.bot.send_message(
@@ -2081,7 +2164,22 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duplicate_entry = check_duplicate_file(file_name, content_size, chat_id)
         
         if duplicate_entry and duplicate_entry.is_recent():
-            # Duplicate found - ask for confirmation
+            # Get status of the old file
+            old_status = duplicate_entry.status
+            status_display = old_status.capitalize()
+            
+            # Get status emoji
+            status_emoji = {
+                'completed': '✅',
+                'uploaded': '📤',
+                'cancelled': '🚫',
+                'deleted': '🗑️',
+                'skipped': '⏭️',
+                'running': '▶️',
+                'paused': '⏸️',
+                'timeout_cancelled': '⏱️'
+            }.get(old_status, '📝')
+            
             time_diff = datetime.now(UTC_PLUS_1) - duplicate_entry.timestamp
             hours_ago = time_diff.total_seconds() / 3600
             
@@ -2109,6 +2207,22 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parts = split_large_content(content, CONTENT_LIMIT_FOR_INTERVALS)
                 state.pending_duplicate_file['parts'] = parts
             
+            # Create status info message
+            status_info = f"Status: {status_emoji} {status_display}"
+            if old_status == 'completed':
+                # Try to get message/parts count from history
+                for entry in file_history.get(chat_id, []):
+                    if (entry['filename'] == file_name and 
+                        abs((entry['timestamp'] - duplicate_entry.timestamp).total_seconds()) < 60):
+                        if entry.get('parts_count', 0) > 0:
+                            status_info += f" ({entry['parts_count']} part{'s' if entry['parts_count'] > 1 else ''}"
+                            if entry.get('messages_count', 0) > 0:
+                                status_info += f", {entry['messages_count']} messages"
+                            status_info += ")"
+                        elif entry.get('messages_count', 0) > 0:
+                            status_info += f" ({entry['messages_count']} message{'s' if entry['messages_count'] > 1 else ''})"
+                        break
+            
             await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=message_thread_id,
@@ -2116,6 +2230,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"File: `{file_name}`\n"
                      f"Size: {content_size:,} bytes\n\n"
                      f"This exact file was already processed {hours_ago:.1f} hours ago.\n"
+                     f"{status_info}\n\n"
                      f"Do you want to post it again?\n\n"
                      f"✅ Yes, Post  ❌ No, Don't",
                 reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2147,8 +2262,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'message_thread_id': message_thread_id
             }
         
-        # Add file to history
-        add_file_to_history(file_name, content_size, chat_id)
+        # Add file to history with "uploaded" status
+        add_file_to_history(file_name, content_size, chat_id, "uploaded")
         
         # Thread-safe queue addition
         queue_size = await add_to_queue_safe(state, file_info)
