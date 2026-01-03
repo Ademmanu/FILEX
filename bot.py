@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FileX Bot - Enhanced with 72-hour message tracking, duplicate detection, and improved deletion
+FileX Bot - Complete Enhanced Version with 72-hour tracking, duplicate detection, and working deletion
 """
 
 import os
@@ -139,18 +139,6 @@ class FileHashEntry:
         return f"FileHashEntry(file={self.filename}, size={self.file_size}, hash={self.content_hash[:8]})"
 
 file_hash_tracking: List[FileHashEntry] = []
-
-# ==================== DELETION STATE MANAGEMENT ====================
-class DeletionState:
-    """Manage state for file deletion operations"""
-    def __init__(self):
-        self.waiting_for_filename: Dict[int, bool] = defaultdict(bool)
-        self.multiple_files_found: Dict[int, List[Dict]] = defaultdict(list)
-        self.last_deleted_file: Dict[int, str] = defaultdict(lambda: None)
-        self.deletion_callback_data: Dict[int, str] = defaultdict(lambda: "")
-
-# Global deletion state manager
-deletion_state = DeletionState()
 
 # ==================== ENHANCED TRACKING FUNCTIONS ====================
 def track_enhanced_message(chat_id: int, message_id: int, message_text: str):
@@ -509,7 +497,7 @@ async def cancelpreview_command(update: Update, context: ContextTypes.DEFAULT_TY
         message_thread_id=update.effective_message.message_thread_id,
         text="🚫 **Preview Mode Cancelled**\n\n"
              "Preview mode has been deactivated.\n\n"
-                 "Use /adminpreview to start preview mode again.",
+             "Use /adminpreview to start preview mode again.",
         parse_mode='Markdown'
     )
 
@@ -596,7 +584,7 @@ async def handle_admin_preview_message(update: Update, context: ContextTypes.DEF
                  "```\n"
                  "Preview: [content]\n"
                  "```\n\n"
-             "Use /cancelpreview to cancel.",
+                 "Use /cancelpreview to cancel.",
             parse_mode='Markdown'
         )
         return
@@ -705,6 +693,10 @@ class UserState:
         # For duplicate file confirmation
         self.duplicate_confirmation_pending = False
         self.pending_duplicate_file = None
+        
+        # For deletion operations
+        self.deletion_mode = False
+        self.deletion_filename = None
         
     def pause(self):
         self.paused = True
@@ -1446,63 +1438,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.pending_duplicate_file = None
         return
     
-    # Handle file selection for deletion
-    elif callback_data.startswith("del_"):
+    # Handle deletion selection
+    elif callback_data.startswith("delfile_"):
         parts = callback_data.split("_")
-        if len(parts) >= 3 and parts[1] == "select":
-            file_index = int(parts[2])
-            chat_id = int(parts[3]) if len(parts) > 3 else query.message.chat_id
-            
-            if chat_id in deletion_state.multiple_files_found:
-                files = deletion_state.multiple_files_found[chat_id]
-                if 0 <= file_index < len(files):
-                    selected_file = files[file_index]
-                    filename = selected_file['filename']
-                    
-                    # Delete the selected file
-                    deleted_count, _ = await delete_file_messages(chat_id, filename, context)
-                    
-                    # Update file history
-                    update_file_history(chat_id, filename, 'deleted')
-                    
-                    # Clean up tracking
-                    state = await get_user_state_safe(chat_id)
-                    state.remove_task_by_name(filename)
-                    
-                    await query.edit_message_text(
-                        text=f"🗑️ `{filename}` content deleted\n"
-                             f"Messages removed: {deleted_count}",
-                        parse_mode='Markdown'
-                    )
-                    
-                    # Reset deletion state
-                    deletion_state.waiting_for_filename[chat_id] = False
-                    deletion_state.multiple_files_found[chat_id] = []
-                    deletion_state.last_deleted_file[chat_id] = filename
-                    deletion_state.deletion_callback_data[chat_id] = ""
-                    
-                    # Check if processing should continue
-                    if state.processing and not state.queue and state.processing_task:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            message_thread_id=message_thread_id,
-                            text="🏁 **Processing stopped**\n\nNo more tasks in queue.",
-                            parse_mode='Markdown'
-                        )
         
-        elif callback_data == "del_cancel":
-            chat_id = query.message.chat_id
+        if parts[1] == "cancel":
+            # User cancelled deletion
+            state.deletion_mode = False
+            state.deletion_filename = None
             await query.edit_message_text(
                 text="❌ **Deletion cancelled**",
                 parse_mode='Markdown'
             )
+            return
             
-            # Reset deletion state
-            deletion_state.waiting_for_filename[chat_id] = False
-            deletion_state.multiple_files_found[chat_id] = []
-            deletion_state.last_deleted_file[chat_id] = None
-            deletion_state.deletion_callback_data[chat_id] = ""
+        elif parts[1] == "select":
+            # User selected a specific file to delete
+            file_index = int(parts[2])
+            selected_filename = parts[3] if len(parts) > 3 else ""
+            
+            # Find the file in history
+            matching_files = []
+            for entry in file_history.get(chat_id, []):
+                if entry['filename'] == selected_filename:
+                    matching_files.append(entry)
+            
+            if 0 <= file_index < len(matching_files):
+                selected_file = matching_files[file_index]
+                filename = selected_file['filename']
+                
+                # Delete the file
+                deleted_count, _ = await delete_file_messages(chat_id, filename, context)
+                
+                # Update file history
+                update_file_history(chat_id, filename, 'deleted')
+                
+                # Remove from queue if present
+                state.remove_task_by_name(filename)
+                
+                await query.edit_message_text(
+                    text=f"🗑️ `{filename}` content deleted\n"
+                         f"Messages removed: {deleted_count}",
+                    parse_mode='Markdown'
+                )
+                
+                # Check if processing should continue
+                if state.processing and not state.queue and state.processing_task:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        message_thread_id=message_thread_id,
+                        text="🏁 **Processing stopped**\n\nNo more tasks in queue.",
+                        parse_mode='Markdown'
+                    )
         
+        # Reset deletion state
+        state.deletion_mode = False
+        state.deletion_filename = None
         return
     
     # Handle operation selection
@@ -1561,6 +1552,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if state.duplicate_confirmation_pending:
         status_lines.append("⚠️ **Duplicate confirmation pending:** Yes")
+    
+    if state.deletion_mode:
+        status_lines.append("🗑️ **Deletion mode:** Yes")
     
     if state.last_send:
         if isinstance(state.last_send, datetime):
@@ -1900,25 +1894,24 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
     message_thread_id = update.effective_message.message_thread_id
     state = await get_user_state_safe(chat_id)
     
-    # Check if already waiting for filename
-    if deletion_state.waiting_for_filename[chat_id]:
+    # Check if already in deletion mode
+    if state.deletion_mode:
         await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=message_thread_id,
-            text="ℹ️ **Already waiting for filename**\n\n"
+            text="ℹ️ **Already in deletion mode**\n\n"
                  "I'm already waiting for a filename to delete.\n"
                  "Please send the filename or click Cancel below.",
             parse_mode='Markdown'
         )
         return
     
-    # Reset deletion state
-    deletion_state.waiting_for_filename[chat_id] = True
-    deletion_state.multiple_files_found[chat_id] = []
-    deletion_state.last_deleted_file[chat_id] = None
+    # Set deletion mode
+    state.deletion_mode = True
+    state.deletion_filename = None
     
     # Create inline keyboard with Cancel button
-    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")]]
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="delfile_cancel")]]
     
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1931,21 +1924,58 @@ async def delfilecontent_command(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode='Markdown'
     )
 
-async def handle_file_deletion_selection(chat_id: int, message_thread_id: Optional[int], 
-                                        filename: str, context: ContextTypes.DEFAULT_TYPE):
-    """Handle file deletion when multiple files with same name are found"""
+async def handle_deletion_filename(chat_id: int, message_thread_id: Optional[int], 
+                                  filename: str, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the filename provided for deletion"""
+    state = await get_user_state_safe(chat_id)
+    
+    if not state.deletion_mode:
+        return
+    
+    # Check if user cancelled
+    if filename.lower() == 'cancel':
+        state.deletion_mode = False
+        state.deletion_filename = None
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text="❌ **Operation cancelled**",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Store the filename
+    state.deletion_filename = filename
+    
     # Find all files with this name
     matching_files = []
     for entry in file_history.get(chat_id, []):
         if entry['filename'] == filename:
             matching_files.append(entry)
     
+    if not matching_files:
+        # No files found
+        state.deletion_mode = False
+        state.deletion_filename = None
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text=f"❌ **File not found**\n\n"
+                 f"No record found for `{filename}` in your history.\n\n"
+                 f"Use /delfilecontent to try again with a different filename.",
+            parse_mode='Markdown'
+        )
+        return
+    
     if len(matching_files) == 1:
-        # Single file found, delete directly
+        # Single file found - delete directly
+        file_entry = matching_files[0]
         deleted_count, _ = await delete_file_messages(chat_id, filename, context)
+        
+        # Update file history
         update_file_history(chat_id, filename, 'deleted')
         
-        state = await get_user_state_safe(chat_id)
+        # Remove from queue if present
         state.remove_task_by_name(filename)
         
         await context.bot.send_message(
@@ -1956,15 +1986,21 @@ async def handle_file_deletion_selection(chat_id: int, message_thread_id: Option
             parse_mode='Markdown'
         )
         
+        # Check if processing should continue
+        if state.processing and not state.queue and state.processing_task:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text="🏁 **Processing stopped**\n\nNo more tasks in queue.",
+                parse_mode='Markdown'
+            )
+        
         # Reset deletion state
-        deletion_state.waiting_for_filename[chat_id] = False
-        deletion_state.last_deleted_file[chat_id] = filename
+        state.deletion_mode = False
+        state.deletion_filename = None
         
-    elif len(matching_files) > 1:
-        # Multiple files found, show selection
-        deletion_state.multiple_files_found[chat_id] = matching_files
-        
-        # Create selection buttons
+    else:
+        # Multiple files found - show selection
         keyboard = []
         for i, file_entry in enumerate(matching_files):
             time_str = file_entry['timestamp'].strftime('%H:%M:%S')
@@ -1973,11 +2009,11 @@ async def handle_file_deletion_selection(chat_id: int, message_thread_id: Option
                 size_info = f" ({file_entry.get('messages_count', 0)} messages)"
             
             button_text = f"File {i+1} - {time_str}{size_info}"
-            callback_data = f"del_select_{i}_{chat_id}"
+            callback_data = f"delfile_select_{i}_{filename}"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
         
         # Add cancel button
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="delfile_cancel")])
         
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1989,20 +2025,7 @@ async def handle_file_deletion_selection(chat_id: int, message_thread_id: Option
             parse_mode='Markdown'
         )
         
-        # Store callback data for validation
-        deletion_state.deletion_callback_data[chat_id] = f"del_select_{chat_id}"
-        
-    else:
-        # No files found
-        deletion_state.waiting_for_filename[chat_id] = False
-        await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text=f"❌ **File not found**\n\n"
-                 f"No record found for `{filename}` in your history.\n\n"
-                 f"Use /delfilecontent to try again with a different filename.",
-            parse_mode='Markdown'
-        )
+        # Keep deletion mode active for callback handling
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_authorization(update, context):
@@ -2017,22 +2040,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_admin_preview_message(update, context)
         return
     
-    # Check if waiting for filename (deletion flow)
-    if deletion_state.waiting_for_filename[chat_id]:
+    # Check if in deletion mode
+    state = await get_user_state_safe(chat_id)
+    if state.deletion_mode:
         filename = update.message.text.strip()
-        
-        if filename.lower() == 'cancel':
-            deletion_state.waiting_for_filename[chat_id] = False
-            deletion_state.last_deleted_file[chat_id] = None
-            await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text="❌ **Operation cancelled**",
-                parse_mode='Markdown'
-            )
-            return
-        
-        await handle_file_deletion_selection(chat_id, message_thread_id, filename, context)
+        await handle_deletion_filename(chat_id, message_thread_id, filename, context)
         return
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2043,9 +2055,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_thread_id = update.effective_message.message_thread_id
     state = await get_user_state_safe(chat_id)
     
-    # Reset deletion state
-    deletion_state.waiting_for_filename[chat_id] = False
-    deletion_state.last_deleted_file[chat_id] = None
+    # Reset deletion mode if active
+    state.deletion_mode = False
+    state.deletion_filename = None
     
     state.cancel_requested = False
     
